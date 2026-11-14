@@ -313,7 +313,38 @@ func TestPrintProgressAndBatchProgress_NoUIModeUsesNewlines(t *testing.T) {
 	if !strings.Contains(out, "\r") {
 		t.Fatalf("expected carriage returns in no-ui mode, got %q", out)
 	}
-	if !strings.Contains(out, "Indexing [") || !strings.Contains(out, "Embedding [") {
+	if !strings.Contains(out, "Checking [") || !strings.Contains(out, "Embedding [") {
 		t.Fatalf("expected inline progress output, got %q", out)
+	}
+}
+
+func TestExistingWorkspaceProjectsSkipsMissingFolders(t *testing.T) {
+	present := t.TempDir()
+	ws := &config.Workspace{
+		Name: "acme",
+		Projects: []config.ProjectEntry{
+			{Name: "api", Path: present},
+			{Name: "old", Path: filepath.Join(present, "deleted")},
+		},
+	}
+	got := existingWorkspaceProjects(ws, true)
+	if len(got) != 1 || got[0].Name != "api" {
+		t.Fatalf("existingWorkspaceProjects() = %+v, want only api", got)
+	}
+}
+
+// An existing but invalid project config must not fall back to defaults (#312).
+func TestNewWorkspaceProjectIndexRuntimeRejectsInvalidConfig(t *testing.T) {
+	projectPath := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(projectPath, ".grepai"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectPath, ".grepai", "config.yaml"), []byte("embedder: [broken\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ws := &config.Workspace{Name: "acme"}
+	project := config.ProjectEntry{Name: "api", Path: projectPath}
+	if _, err := newWorkspaceProjectIndexRuntime(context.Background(), ws, project, nil, nil); err == nil {
+		t.Fatal("expected an error for an invalid project config")
 	}
 }

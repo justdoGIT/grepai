@@ -55,6 +55,8 @@ var languagePatterns = map[string]*LanguagePatterns{
 	".fs":   fsharpPatterns,
 	".fsx":  fsharpPatterns,
 	".fsi":  fsharpPatterns,
+	".gd":   gdscriptPatterns,
+	".rb":   rubyPatterns,
 }
 
 // Go patterns
@@ -181,6 +183,32 @@ var pythonPatterns = &LanguagePatterns{
 	MethodCall:   regexp.MustCompile(`\.([A-Za-z_][A-Za-z0-9_]*)\s*\(`),
 }
 
+// Ruby patterns. Method names may end with ?, ! or = (setters). Calls
+// without parentheses are common, so method calls (receiver.method) match
+// with or without them; bare function calls need parentheses.
+var rubyPatterns = &LanguagePatterns{
+	Extension: ".rb",
+	Language:  "ruby",
+	Functions: []*regexp.Regexp{
+		// def name / def self.name at top level
+		regexp.MustCompile(`(?m)^def\s+(?:self\.)?([A-Za-z_][A-Za-z0-9_]*[?!=]?)`),
+	},
+	Methods: []*regexp.Regexp{
+		// def name / def self.name inside a class or module (indented)
+		regexp.MustCompile(`(?m)^[ \t]+def\s+(?:self\.)?([A-Za-z_][A-Za-z0-9_]*[?!=]?)`),
+	},
+	Classes: []*regexp.Regexp{
+		// class Name, class Name < Base, class Outer::Name
+		regexp.MustCompile(`(?m)^[ \t]*class\s+(?:[A-Z][A-Za-z0-9_]*::)*([A-Z][A-Za-z0-9_]*)`),
+	},
+	Types: []*regexp.Regexp{
+		// module Name
+		regexp.MustCompile(`(?m)^[ \t]*module\s+(?:[A-Z][A-Za-z0-9_]*::)*([A-Z][A-Za-z0-9_]*)`),
+	},
+	FunctionCall: regexp.MustCompile(`\b([a-z_][A-Za-z0-9_]*[?!]?)\s*\(`),
+	MethodCall:   regexp.MustCompile(`\.([a-z_][A-Za-z0-9_]*[?!]?)`),
+}
+
 // PHP patterns
 var phpPatterns = &LanguagePatterns{
 	Extension: ".php",
@@ -203,6 +231,32 @@ var phpPatterns = &LanguagePatterns{
 	},
 	FunctionCall: regexp.MustCompile(`\b([A-Za-z_][A-Za-z0-9_]*)\s*\(`),
 	MethodCall:   regexp.MustCompile(`(?:->|::)([A-Za-z_][A-Za-z0-9_]*)\s*\(`),
+}
+
+// GDScript patterns (Godot 4)
+var gdscriptPatterns = &LanguagePatterns{
+	Extension: ".gd",
+	Language:  "gdscript",
+	Functions: []*regexp.Regexp{
+		// [@annotation(...)] func function_name(params) -> ReturnType:
+		// Annotations may share the declaration line; [ \t] (not \s) keeps the
+		// optional annotation prefix from matching across a newline.
+		regexp.MustCompile(`(?m)^(?:@[A-Za-z_][A-Za-z0-9_]*(?:\([^)]*\))?[ \t]+)*func[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*\(`),
+		// [@annotation(...)] static func function_name(params):
+		regexp.MustCompile(`(?m)^(?:@[A-Za-z_][A-Za-z0-9_]*(?:\([^)]*\))?[ \t]+)*static[ \t]+func[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*\(`),
+	},
+	Methods: []*regexp.Regexp{
+		// [@annotation(...)] func method_name(params): inside an inner class (indented)
+		regexp.MustCompile(`(?m)^[ \t]+(?:@[A-Za-z_][A-Za-z0-9_]*(?:\([^)]*\))?[ \t]+)*(?:static[ \t]+)?func[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*\(`),
+	},
+	Classes: []*regexp.Regexp{
+		// class_name ClassName
+		regexp.MustCompile(`(?m)^class_name\s+([A-Za-z_][A-Za-z0-9_]*)`),
+		// class InnerClass extends Base:
+		regexp.MustCompile(`(?m)^[ \t]*class\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+extends\s+[A-Za-z_][A-Za-z0-9_.]*)?\s*:`),
+	},
+	FunctionCall: regexp.MustCompile(`\b([A-Za-z_][A-Za-z0-9_]*)\s*\(`),
+	MethodCall:   regexp.MustCompile(`\.([A-Za-z_][A-Za-z0-9_]*)\s*\(`),
 }
 
 // Lua patterns
@@ -262,6 +316,36 @@ var languageKeywords = map[string]map[string]bool{
 		"int": true, "float": true, "bool": true, "type": true, "isinstance": true,
 		"hasattr": true, "getattr": true, "setattr": true, "delattr": true,
 		"open": true, "input": true, "super": true,
+		// Syntax keywords: "except (", "in (", "not (" are never calls.
+		"elif": true, "else": true, "except": true, "in": true, "not": true,
+		"and": true, "or": true, "is": true, "import": true, "from": true,
+		"lambda": true, "del": true, "await": true, "async": true, "def": true,
+		"class": true, "try": true, "finally": true, "global": true, "nonlocal": true,
+	},
+	"ruby": {
+		"if": true, "unless": true, "elsif": true, "else": true, "while": true,
+		"until": true, "for": true, "in": true, "case": true, "when": true,
+		"return": true, "yield": true, "raise": true, "def": true, "class": true,
+		"module": true, "end": true, "do": true, "begin": true, "rescue": true,
+		"ensure": true, "not": true, "and": true, "or": true, "defined?": true,
+		"super": true, "self": true, "lambda": true, "proc": true, "loop": true,
+		"puts": true, "print": true, "p": true, "require": true, "require_relative": true,
+		"include": true, "extend": true, "attr_accessor": true, "attr_reader": true,
+		"attr_writer": true, "private": true, "protected": true, "public": true,
+	},
+	"gdscript": {
+		"if": true, "elif": true, "else": true, "for": true, "while": true,
+		"match": true, "return": true, "await": true, "func": true, "class": true,
+		"class_name": true, "extends": true, "signal": true, "enum": true,
+		"var": true, "const": true, "static": true, "pass": true, "break": true,
+		"continue": true, "new": true, "super": true, "self": true, "in": true,
+		"as": true, "is": true, "assert": true, "print": true, "str": true,
+		"int": true, "float": true, "bool": true, "range": true,
+		"typeof": true, "preload": true, "load": true, "get_node": true,
+		"get_parent": true, "queue_free": true, "connect": true,
+		"emit_signal": true, "call": true, "callv": true, "call_deferred": true,
+		"has_method": true, "size": true, "length": true, "instantiate": true,
+		"duplicate": true,
 	},
 	"php": {
 		"if": true, "for": true, "foreach": true, "while": true, "switch": true,

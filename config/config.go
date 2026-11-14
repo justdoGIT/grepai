@@ -1,6 +1,7 @@
 package config
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/yoanbernabeu/grepai/git"
+	"github.com/yoanbernabeu/grepai/internal/fileutil"
 	"gopkg.in/yaml.v3"
 )
 
@@ -24,6 +26,7 @@ const (
 	DefaultOpenAIEmbeddingModel     = "text-embedding-3-small"
 	DefaultSyntheticEmbeddingModel  = "hf:nomic-ai/nomic-embed-text-v1.5"
 	DefaultOpenRouterEmbeddingModel = "openai/text-embedding-3-small"
+	DefaultRequestyEmbeddingModel   = "openai/text-embedding-3-small"
 	OpenAIEmbeddingModelLarge       = "text-embedding-3-large"
 	OpenRouterEmbeddingModelLarge   = "openai/text-embedding-3-large"
 	OpenRouterEmbeddingModelQwen8B  = "qwen/qwen3-embedding-8b"
@@ -33,6 +36,7 @@ const (
 	DefaultOpenAIEndpoint     = "https://api.openai.com/v1"
 	DefaultSyntheticEndpoint  = "https://api.synthetic.new/openai/v1"
 	DefaultOpenRouterEndpoint = "https://openrouter.ai/api/v1"
+	DefaultRequestyEndpoint   = "https://router.requesty.ai/v1"
 
 	DefaultLocalEmbeddingDimensions = 768
 	DefaultOpenAIDimensions         = 1536
@@ -68,14 +72,8 @@ type Config struct {
 	Search            SearchConfig    `yaml:"search"`
 	Trace             TraceConfig     `yaml:"trace"`
 	RPG               RPGConfig       `yaml:"rpg"`
-	Update            UpdateConfig    `yaml:"update"`
 	Ignore            []string        `yaml:"ignore"`
 	ExternalGitignore string          `yaml:"external_gitignore,omitempty"`
-}
-
-// UpdateConfig holds auto-update settings
-type UpdateConfig struct {
-	CheckOnStartup bool `yaml:"check_on_startup"` // Check for updates when running commands
 }
 
 type SearchConfig struct {
@@ -106,12 +104,32 @@ type BoostRule struct {
 }
 
 type EmbedderConfig struct {
-	Provider    string `yaml:"provider"` // ollama | lmstudio | openai | synthetic | openrouter
+	Provider    string `yaml:"provider"` // ollama | lmstudio | openai | synthetic | openrouter | requesty
 	Model       string `yaml:"model"`
 	Endpoint    string `yaml:"endpoint,omitempty"`
 	APIKey      string `yaml:"api_key,omitempty"`
 	Dimensions  *int   `yaml:"dimensions,omitempty"`
 	Parallelism int    `yaml:"parallelism"` // Number of parallel workers for batch embedding (default: 4)
+	// RequestTimeoutSeconds is the HTTP client timeout for a single embedding
+	// request. 0 (the default) preserves the historical 60-second value.
+	// Raise this when running against slow self-hosted endpoints
+	// (e.g., ollama-cuda on a shared GPU) where embedding a full batch can
+	// take longer than a minute.
+	RequestTimeoutSeconds int `yaml:"request_timeout_seconds,omitempty"`
+	// MaxRetries caps the number of retry attempts for transient embedding
+	// failures (HTTP 429 / 5xx). 0 (the default) preserves the historical
+	// value of 5. Only consumed by providers that implement retry today
+	// (openai); other providers ignore it.
+	MaxRetries int `yaml:"max_retries,omitempty"`
+	// MaxBatchSize caps the number of inputs sent in one embedding request.
+	// 0 (the default) keeps the OpenAI limit of 2000. Lower it for
+	// OpenAI-compatible endpoints that time out or reject large batches.
+	// Only consumed by the openai provider.
+	MaxBatchSize int `yaml:"max_batch_size,omitempty"`
+	// MaxBatchTokens caps the estimated tokens sent in one embedding request.
+	// 0 (the default) keeps the OpenAI limit of 280000. Only consumed by the
+	// openai provider.
+	MaxBatchTokens int `yaml:"max_batch_tokens,omitempty"`
 }
 
 // GetDimensions returns the configured dimensions or a default value.
@@ -122,7 +140,7 @@ func (e *EmbedderConfig) GetDimensions() int {
 		return *e.Dimensions
 	}
 	switch e.Provider {
-	case "openai", "openrouter":
+	case "openai", "openrouter", "requesty":
 		switch strings.TrimSpace(e.Model) {
 		case OpenAIEmbeddingModelLarge, OpenRouterEmbeddingModelLarge:
 			return DefaultOpenAILargeDimensions
@@ -134,6 +152,18 @@ func (e *EmbedderConfig) GetDimensions() int {
 	default:
 		return DefaultLocalEmbeddingDimensions
 	}
+}
+
+// CacheNamespace returns the semantic namespace used for embedding-cache reuse.
+// It intentionally excludes secrets such as API keys.
+func (e *EmbedderConfig) CacheNamespace() string {
+	return fmt.Sprintf(
+		"embedding-cache-v2:provider=%s:model=%s:dimensions=%d:endpoint=%s",
+		strings.TrimSpace(e.Provider),
+		strings.TrimSpace(e.Model),
+		e.GetDimensions(),
+		strings.TrimSpace(e.Endpoint),
+	)
 }
 
 func DefaultEmbedderForProvider(provider string) EmbedderConfig {
@@ -151,6 +181,13 @@ func DefaultEmbedderForProvider(provider string) EmbedderConfig {
 			Provider:   "openrouter",
 			Model:      DefaultOpenRouterEmbeddingModel,
 			Endpoint:   DefaultOpenRouterEndpoint,
+			Dimensions: nil,
+		}
+	case "requesty":
+		return EmbedderConfig{
+			Provider:   "requesty",
+			Model:      DefaultRequestyEmbeddingModel,
+			Endpoint:   DefaultRequestyEndpoint,
 			Dimensions: nil,
 		}
 	case "lmstudio":
@@ -201,8 +238,15 @@ type QdrantConfig struct {
 }
 
 type ChunkingConfig struct {
-	Size    int `yaml:"size"`
-	Overlap int `yaml:"overlap"`
+	Size     int    `yaml:"size"`
+	Overlap  int    `yaml:"overlap"`
+	Strategy string `yaml:"strategy"` // "fixed" (default) or "ast"
+	// CustomExtensions extends the built-in SupportedExtensions list with
+	// additional file extensions to index (e.g. [".tengo", ".el"]). Each
+	// entry must include the leading dot and is matched case-insensitively.
+	// Binary detection (UTF-8 + null-byte check) still applies, so adding
+	// a binary extension here is safe.
+	CustomExtensions []string `yaml:"custom_extensions,omitempty"`
 }
 
 func DefaultStoreForBackend(backend string) StoreConfig {
@@ -284,17 +328,25 @@ type WatchConfig struct {
 	RPGDerivedDebounceMs        int       `yaml:"rpg_derived_debounce_ms,omitempty"`
 	RPGFullReconcileIntervalSec int       `yaml:"rpg_full_reconcile_interval_sec,omitempty"`
 	RPGMaxDirtyFilesPerBatch    int       `yaml:"rpg_max_dirty_files_per_batch,omitempty"`
+	// DiscoverWorktrees controls automatic discovery (and watching) of linked
+	// git worktrees. A pointer is used so that configs without the key keep
+	// the historical default (enabled). Only the main worktree's config is
+	// consulted — the key is ignored in linked-worktree config copies.
+	DiscoverWorktrees *bool `yaml:"discover_worktrees,omitempty"`
+}
+
+// WorktreeDiscoveryEnabled reports whether linked git worktrees should be
+// auto-discovered and watched. Defaults to true when the option is not set.
+func (w WatchConfig) WorktreeDiscoveryEnabled() bool {
+	return w.DiscoverWorktrees == nil || *w.DiscoverWorktrees
 }
 
 type TraceConfig struct {
-	Mode             string   `yaml:"mode"`              // fast or precise
 	EnabledLanguages []string `yaml:"enabled_languages"` // File extensions to index
-	ExcludePatterns  []string `yaml:"exclude_patterns"`  // Patterns to exclude
 }
 
 type RPGConfig struct {
 	Enabled              bool    `yaml:"enabled"`
-	StorePath            string  `yaml:"store_path,omitempty"`
 	FeatureMode          string  `yaml:"feature_mode"` // local | hybrid | llm
 	DriftThreshold       float64 `yaml:"drift_threshold"`
 	MaxTraversalDepth    int     `yaml:"max_traversal_depth"`
@@ -352,8 +404,9 @@ func DefaultConfig() *Config {
 		Embedder: DefaultEmbedderForProvider(DefaultEmbedderProvider),
 		Store:    DefaultStoreForBackend("gob"),
 		Chunking: ChunkingConfig{
-			Size:    512,
-			Overlap: 50,
+			Size:     512,
+			Overlap:  50,
+			Strategy: "fixed",
 		},
 		Framework: FrameworkConfig{
 			Enabled:  true,
@@ -416,22 +469,15 @@ func DefaultConfig() *Config {
 			},
 		},
 		Trace: TraceConfig{
-			Mode: "fast",
 			EnabledLanguages: []string{
 				".go", ".js", ".ts", ".jsx", ".tsx", ".vue", ".py", ".php",
 				".lua",
-				".c", ".h", ".cpp", ".hpp", ".cc", ".cxx",
+				".gd", // GDScript (Godot)
+				".rb", // Ruby
+				".c", ".h", ".cpp", ".hpp", ".cc", ".cxx", ".hxx",
 				".rs", ".zig", ".cs", ".java",
 				".fs", ".fsx", ".fsi", // F#
 				".pas", ".dpr", // Pascal/Delphi
-			},
-			ExcludePatterns: []string{
-				"*_test.go",
-				"*.spec.ts",
-				"*.spec.js",
-				"*.test.ts",
-				"*.test.js",
-				"__tests__/*",
 			},
 		},
 		RPG: RPGConfig{
@@ -444,9 +490,6 @@ func DefaultConfig() *Config {
 			LLMEndpoint:          "http://localhost:11434/v1",
 			LLMTimeoutMs:         DefaultRPGLLMTimeoutMs,
 			FeatureGroupStrategy: DefaultRPGFeatureGroupStrategy,
-		},
-		Update: UpdateConfig{
-			CheckOnStartup: false, // Opt-in by default for privacy
 		},
 		Ignore: []string{
 			".git",
@@ -551,6 +594,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Chunking.Overlap == 0 {
 		c.Chunking.Overlap = defaults.Chunking.Overlap
+	}
+	if c.Chunking.Strategy == "" {
+		c.Chunking.Strategy = defaults.Chunking.Strategy
 	}
 
 	// Framework processing defaults
@@ -720,37 +766,69 @@ func AutoInitWorktree(worktreeRoot, mainWorktree string) error {
 // search and trace work immediately with the main worktree's index as a seed,
 // and watch will incrementally update for worktree-specific changes.
 func autoInitFromMainWorktree(worktreeRoot, mainWorktree string) error {
+	return autoInitFromMainWorktreeWithCopy(worktreeRoot, mainWorktree, copyFileIfExists)
+}
+
+func autoInitFromMainWorktreeWithCopy(worktreeRoot, mainWorktree string, copyFile func(src, dst string) error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	writerLock, err := fileutil.AcquireProjectWriterLockContext(ctx, worktreeRoot)
+	if err != nil {
+		return fmt.Errorf("failed to lock worktree auto-init: %w", err)
+	}
+	defer writerLock.Close()
+	worktreeRoot = writerLock.ProjectRoot()
+
+	// config.yaml is the completion marker and is copied last. If another
+	// initializer completed while this caller waited, its seed is ready to use.
+	if projectConfigIsValid(worktreeRoot) {
+		return nil
+	}
+
 	localGrepai := filepath.Join(worktreeRoot, ".grepai")
 	if err := os.MkdirAll(localGrepai, 0755); err != nil {
 		return err
 	}
 
 	mainGrepai := filepath.Join(mainWorktree, ".grepai")
-
-	// Copy config.yaml (required)
-	srcConfig := filepath.Join(mainGrepai, "config.yaml")
-	dstConfig := filepath.Join(localGrepai, "config.yaml")
-	if err := copyFileIfExists(srcConfig, dstConfig); err != nil {
-		os.RemoveAll(localGrepai)
-		return err
-	}
-	// Verify config.yaml was actually copied (it's required)
-	if _, err := os.Stat(dstConfig); os.IsNotExist(err) {
-		os.RemoveAll(localGrepai)
-		return fmt.Errorf("config.yaml not found in main worktree: %s", srcConfig)
+	created := make([]string, 0, 3)
+	cleanup := func() {
+		for _, path := range created {
+			_ = os.Remove(path)
+		}
 	}
 
 	// Copy index.gob as seed (search works immediately)
-	_ = copyFileIfExists(
-		filepath.Join(mainGrepai, "index.gob"),
-		filepath.Join(localGrepai, "index.gob"),
-	)
+	dstIndex := filepath.Join(localGrepai, "index.gob")
+	created = append(created, dstIndex)
+	_ = os.Remove(dstIndex)
+	if err := copyFile(filepath.Join(mainGrepai, "index.gob"), dstIndex); err != nil {
+		cleanup()
+		return err
+	}
 
 	// Copy symbols.gob as seed (trace works immediately)
-	_ = copyFileIfExists(
-		filepath.Join(mainGrepai, "symbols.gob"),
-		filepath.Join(localGrepai, "symbols.gob"),
-	)
+	dstSymbols := filepath.Join(localGrepai, "symbols.gob")
+	created = append(created, dstSymbols)
+	_ = os.Remove(dstSymbols)
+	if err := copyFile(filepath.Join(mainGrepai, "symbols.gob"), dstSymbols); err != nil {
+		cleanup()
+		return err
+	}
+
+	// Copy required config last so its presence means every seed copy finished.
+	srcConfig := filepath.Join(mainGrepai, "config.yaml")
+	dstConfig := filepath.Join(localGrepai, "config.yaml")
+	created = append(created, dstConfig)
+	_ = os.Remove(dstConfig)
+	if err := copyFile(srcConfig, dstConfig); err != nil {
+		cleanup()
+		return err
+	}
+	if !projectConfigIsValid(worktreeRoot) {
+		cleanup()
+		return fmt.Errorf("valid config.yaml not found in main worktree: %s", srcConfig)
+	}
 
 	// Ensure .grepai/ is in .gitignore
 	ensureGitignoreEntry(worktreeRoot, ".grepai/")
@@ -758,17 +836,9 @@ func autoInitFromMainWorktree(worktreeRoot, mainWorktree string) error {
 	return nil
 }
 
-// copyFileIfExists copies src to dst if src exists. Returns error only if src
-// exists but copy fails. Returns nil if src doesn't exist.
-func copyFileIfExists(src, dst string) error {
-	data, err := os.ReadFile(src)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	return os.WriteFile(dst, data, 0600)
+func projectConfigIsValid(projectRoot string) bool {
+	_, err := Load(projectRoot)
+	return err == nil
 }
 
 // ensureGitignoreEntry adds an entry to .gitignore if not already present.

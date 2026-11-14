@@ -445,11 +445,11 @@ func TestRegisterTools_should_document_search_path_scope_and_examples(t *testing
 	}
 
 	desc := searchTool.Tool.Description
-	if !strings.Contains(desc, "workspace-only mode") {
-		t.Fatalf("search tool description missing workspace-only example: %q", desc)
+	if !strings.Contains(desc, "path starts with the project name") {
+		t.Fatalf("search tool description missing whole-workspace example: %q", desc)
 	}
-	if !strings.Contains(desc, "workspace + projects mode") {
-		t.Fatalf("search tool description missing workspace+projects example: %q", desc)
+	if !strings.Contains(desc, "path relative to that project") {
+		t.Fatalf("search tool description missing single-project example: %q", desc)
 	}
 
 	pathPropRaw, ok := searchTool.Tool.InputSchema.Properties["path"]
@@ -461,11 +461,52 @@ func TestRegisterTools_should_document_search_path_scope_and_examples(t *testing
 		t.Fatalf("path property is not object, got %T", pathPropRaw)
 	}
 	pathDesc, _ := pathProp["description"].(string)
-	if !strings.Contains(pathDesc, "relative to each selected project root") {
-		t.Fatalf("path description missing selected project root guidance: %q", pathDesc)
+	if !strings.Contains(pathDesc, "relative to that project root") {
+		t.Fatalf("path description missing single-project guidance: %q", pathDesc)
 	}
-	if !strings.Contains(pathDesc, "not workspace root") {
-		t.Fatalf("path description missing workspace-root clarification: %q", pathDesc)
+	if !strings.Contains(pathDesc, "must start with the project name") {
+		t.Fatalf("path description missing whole-workspace guidance: %q", pathDesc)
+	}
+}
+
+// Without exactly one project, a workspace path starts with the project name,
+// like the CLI (stored paths are <workspace>/<project>/<path>).
+func TestValidateWorkspacePathForProjects_requires_project_prefix_without_single_project(t *testing.T) {
+	ws := &config.Workspace{
+		Name: "acme",
+		Projects: []config.ProjectEntry{
+			{Name: "backend", Path: t.TempDir()},
+			{Name: "frontend", Path: t.TempDir()},
+		},
+	}
+
+	for _, tc := range []struct {
+		path     string
+		projects []string
+		wantOK   bool
+	}{
+		{"backend/src", nil, true},
+		{"frontend", nil, true},
+		{"src", nil, false},
+		{"backend/src", []string{"backend", "frontend"}, true},
+		{"frontend/app", []string{"backend", "shared"}, false},
+	} {
+		errMsg := validateWorkspacePathForProjects(tc.path, ws, tc.projects)
+		if (errMsg == "") != tc.wantOK {
+			t.Errorf("validate(%q, %v): got error %q, want ok=%v", tc.path, tc.projects, errMsg, tc.wantOK)
+		}
+	}
+}
+
+// A single-project path is not rejected when the project root does not exist
+// on the machine serving MCP (index built elsewhere).
+func TestValidateWorkspacePathForProjects_skips_missing_local_root(t *testing.T) {
+	ws := &config.Workspace{
+		Name:     "acme",
+		Projects: []config.ProjectEntry{{Name: "backend", Path: "/does/not/exist/backend"}},
+	}
+	if errMsg := validateWorkspacePathForProjects("src", ws, []string{"backend"}); errMsg != "" {
+		t.Fatalf("expected no error for a root missing on this host, got: %s", errMsg)
 	}
 }
 
@@ -826,7 +867,7 @@ func TestHandleTraceCallersFromStores_should_aggregate_across_stores(t *testing.
 	s := &Server{}
 	stores := []trace.SymbolStore{store1, store2}
 
-	result, err := s.handleTraceCallersFromStores(ctx, "Login", false, "json", stores)
+	result, err := s.handleTraceCallersFromStores(ctx, "", "Login", false, "json", stores)
 	if err != nil {
 		t.Fatalf("handleTraceCallersFromStores returned error: %v", err)
 	}
@@ -881,7 +922,7 @@ func TestHandleTraceCalleesFromStores_should_aggregate_across_stores(t *testing.
 	s := &Server{}
 	stores := []trace.SymbolStore{store1, store2}
 
-	result, err := s.handleTraceCalleesFromStores(ctx, "HandleRequest", false, "json", stores)
+	result, err := s.handleTraceCalleesFromStores(ctx, "", "HandleRequest", false, "json", stores)
 	if err != nil {
 		t.Fatalf("handleTraceCalleesFromStores returned error: %v", err)
 	}
@@ -898,5 +939,37 @@ func TestHandleTraceCalleesFromStores_should_aggregate_across_stores(t *testing.
 	}
 	if !strings.Contains(text, "SendResponse") {
 		t.Errorf("expected result to contain callee 'SendResponse', got: %s", text)
+	}
+}
+
+// RPG tools read the graph of a workspace project (#296).
+func TestRPGProjectRootResolvesWorkspaceProject(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", os.Getenv("HOME"))
+	apiPath, webPath := t.TempDir(), t.TempDir()
+	wsCfg := &config.WorkspaceConfig{Version: 1}
+	if err := wsCfg.AddWorkspace(config.Workspace{
+		Name:     "acme",
+		Projects: []config.ProjectEntry{{Name: "api", Path: apiPath}, {Name: "web", Path: webPath}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveWorkspaceConfig(wsCfg); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Server{projectRoot: "/server/project"}
+	req := func(args map[string]any) mcp.CallToolRequest {
+		return mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: args}}
+	}
+
+	if root, err := s.rpgProjectRoot(req(map[string]any{})); err != nil || root != "/server/project" {
+		t.Fatalf("without workspace: got %q, %v", root, err)
+	}
+	if root, err := s.rpgProjectRoot(req(map[string]any{"workspace": "acme", "project": "web"})); err != nil || root != webPath {
+		t.Fatalf("workspace project: got %q, %v", root, err)
+	}
+	if _, err := s.rpgProjectRoot(req(map[string]any{"workspace": "acme"})); err == nil || !strings.Contains(err.Error(), "api, web") {
+		t.Fatalf("expected an error listing the projects, got %v", err)
 	}
 }

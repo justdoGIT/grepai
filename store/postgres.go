@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -11,21 +12,29 @@ import (
 )
 
 type PostgresStore struct {
-	pool       *pgxpool.Pool
-	projectID  string
-	dimensions int
+	pool                    *pgxpool.Pool
+	projectID               string
+	dimensions              int
+	embeddingCacheNamespace string
 }
 
-func NewPostgresStore(ctx context.Context, dsn string, projectID string, vectorDimensions int) (*PostgresStore, error) {
+const lookupByContentHashSQL = `SELECT vector FROM chunks WHERE project_id = $1 AND content_hash = $2 AND embedding_cache_namespace = $3 AND left(content, length($4::text)) = $4::text AND vector IS NOT NULL LIMIT 1`
+
+func NewPostgresStore(ctx context.Context, dsn string, projectID string, vectorDimensions int, embeddingCacheNamespace ...string) (*PostgresStore, error) {
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to postgres: %w", err)
 	}
+	cacheNamespace := fmt.Sprintf("embedding-cache-v2:dimensions=%d", vectorDimensions)
+	if len(embeddingCacheNamespace) > 0 {
+		cacheNamespace = embeddingCacheNamespace[0]
+	}
 
 	store := &PostgresStore{
-		pool:       pool,
-		projectID:  projectID,
-		dimensions: vectorDimensions,
+		pool:                    pool,
+		projectID:               projectID,
+		dimensions:              vectorDimensions,
+		embeddingCacheNamespace: cacheNamespace,
 	}
 
 	if err := store.ensureSchema(ctx); err != nil {
@@ -61,7 +70,8 @@ func (s *PostgresStore) ensureSchema(ctx context.Context) error {
 			PRIMARY KEY (project_id, path)
 		)`,
 		`ALTER TABLE chunks ADD COLUMN IF NOT EXISTS content_hash TEXT DEFAULT ''`,
-		`CREATE INDEX IF NOT EXISTS idx_chunks_content_hash ON chunks(content_hash) WHERE content_hash != ''`,
+		`ALTER TABLE chunks ADD COLUMN IF NOT EXISTS embedding_cache_namespace TEXT NOT NULL DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_chunks_project_content_cache ON chunks(project_id, content_hash, embedding_cache_namespace) WHERE content_hash != ''`,
 		buildEnsureVectorSQL(s.dimensions),
 		// Migrate chunks primary key from (id) to (project_id, id) so that
 		// worktrees sharing the same database get their own chunk rows instead
@@ -99,8 +109,8 @@ func (s *PostgresStore) SaveChunks(ctx context.Context, chunks []Chunk) error {
 	for _, chunk := range chunks {
 		vec := pgvector.NewVector(chunk.Vector)
 		batch.Queue(
-			`INSERT INTO chunks (id, project_id, file_path, start_line, end_line, content, vector, hash, content_hash, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			`INSERT INTO chunks (id, project_id, file_path, start_line, end_line, content, vector, hash, content_hash, embedding_cache_namespace, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 			ON CONFLICT (project_id, id) DO UPDATE SET
 				file_path = EXCLUDED.file_path,
 				start_line = EXCLUDED.start_line,
@@ -109,9 +119,10 @@ func (s *PostgresStore) SaveChunks(ctx context.Context, chunks []Chunk) error {
 				vector = EXCLUDED.vector,
 				hash = EXCLUDED.hash,
 				content_hash = EXCLUDED.content_hash,
+				embedding_cache_namespace = EXCLUDED.embedding_cache_namespace,
 				updated_at = EXCLUDED.updated_at`,
 			chunk.ID, s.projectID, chunk.FilePath, chunk.StartLine, chunk.EndLine,
-			chunk.Content, vec, chunk.Hash, chunk.ContentHash, chunk.UpdatedAt,
+			chunk.Content, vec, chunk.Hash, chunk.ContentHash, s.embeddingCacheNamespace, chunk.UpdatedAt,
 		)
 	}
 
@@ -128,8 +139,15 @@ func (s *PostgresStore) SaveChunks(ctx context.Context, chunks []Chunk) error {
 }
 
 func (s *PostgresStore) DeleteByFile(ctx context.Context, filePath string) error {
+	// Clear the document's chunk IDs in the same statement, so a crash before
+	// the new chunks are saved never leaves a document pointing at deleted
+	// chunks, which the next scan would trust and skip (#356).
 	_, err := s.pool.Exec(ctx,
-		`DELETE FROM chunks WHERE project_id = $1 AND file_path = $2`,
+		`WITH deleted AS (
+			DELETE FROM chunks WHERE project_id = $1 AND file_path = $2
+		)
+		UPDATE documents SET chunk_ids = '{}'
+		WHERE project_id = $1 AND path = $2`,
 		s.projectID, filePath,
 	)
 	if err != nil {
@@ -151,8 +169,8 @@ func (s *PostgresStore) Search(ctx context.Context, queryVector []float32, limit
 
 	// Add path prefix filter if provided
 	if opts.PathPrefix != "" {
-		query += ` AND file_path LIKE $` + fmt.Sprintf("%d", nextParam)
-		args = append(args, opts.PathPrefix+"%")
+		query += ` AND file_path LIKE $` + fmt.Sprintf("%d", nextParam) + ` ESCAPE '\'`
+		args = append(args, escapeLikePattern(opts.PathPrefix)+"%")
 		nextParam++
 	}
 
@@ -374,15 +392,15 @@ func (s *PostgresStore) GetAllChunks(ctx context.Context) ([]Chunk, error) {
 }
 
 // LookupByContentHash queries the chunks table for a matching content hash and returns the vector.
-func (s *PostgresStore) LookupByContentHash(ctx context.Context, contentHash string) ([]float32, bool, error) {
+func (s *PostgresStore) LookupByContentHash(ctx context.Context, contentHash, contentPrefix string) ([]float32, bool, error) {
 	if contentHash == "" {
 		return nil, false, nil
 	}
 
 	var vec pgvector.Vector
 	err := s.pool.QueryRow(ctx,
-		`SELECT vector FROM chunks WHERE content_hash = $1 AND vector IS NOT NULL LIMIT 1`,
-		contentHash,
+		lookupByContentHashSQL,
+		s.projectID, contentHash, s.embeddingCacheNamespace, contentPrefix,
 	).Scan(&vec)
 
 	if err == pgx.ErrNoRows {
@@ -417,4 +435,12 @@ BEGIN
 	END IF;
 END$$;
 `, dim, dim, dim, dim)
+}
+
+var likePatternEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
+// escapeLikePattern escapes LIKE wildcards so the value matches literally.
+// It must be used with `ESCAPE '\'`.
+func escapeLikePattern(s string) string {
+	return likePatternEscaper.Replace(s)
 }

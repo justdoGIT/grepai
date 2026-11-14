@@ -129,6 +129,9 @@ func TestComputeBoostFactor(t *testing.T) {
 		{"foo_test.go", 0.5},
 		{"project/src/main.go", 1.1},        // matches /src/
 		{"project/tests/foo_test.go", 0.25}, // matches /tests/ and _test.
+		{"src/main.go", 1.1},                // top-level directory matches /src/
+		{"tests/helpers.go", 0.5},           // top-level directory matches /tests/
+		{"mysrc/main.go", 1.0},              // a directory merely ending in "src" does not match
 	}
 
 	for _, tt := range tests {
@@ -138,5 +141,36 @@ func TestComputeBoostFactor(t *testing.T) {
 				t.Errorf("computeBoostFactor(%s) = %f, want %f", tt.path, factor, tt.expected)
 			}
 		})
+	}
+}
+
+// Boost factors collapse distinct scores onto equal ones, so boosting can
+// create ties of its own. The result order must not depend on where the tied
+// results happened to sit before the sort.
+func TestApplyBoost_TiedScoresOrderByChunkID(t *testing.T) {
+	results := []store.SearchResult{
+		{Chunk: store.Chunk{ID: "d", FilePath: "src/d.go"}, Score: 0.5},
+		{Chunk: store.Chunk{ID: "b", FilePath: "b_test.go"}, Score: 1.0},
+		{Chunk: store.Chunk{ID: "c", FilePath: "src/c.go"}, Score: 0.5},
+		{Chunk: store.Chunk{ID: "a", FilePath: "a_test.go"}, Score: 1.0},
+	}
+
+	boostCfg := config.BoostConfig{
+		Enabled:   true,
+		Penalties: []config.BoostRule{{Pattern: "_test.", Factor: 0.5}},
+	}
+
+	// Every result lands on 0.5 after boosting.
+	boosted := ApplyBoost(results, boostCfg)
+
+	want := []string{"a", "b", "c", "d"}
+	got := make([]string, 0, len(boosted))
+	for _, r := range boosted {
+		got = append(got, r.Chunk.ID)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("ApplyBoost() = %v, want %v", got, want)
+		}
 	}
 }

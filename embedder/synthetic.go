@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"time"
 )
 
@@ -55,7 +54,9 @@ type SyntheticOption func(*SyntheticEmbedder)
 
 func WithSyntheticEndpoint(endpoint string) SyntheticOption {
 	return func(e *SyntheticEmbedder) {
-		e.endpoint = endpoint
+		if endpoint != "" {
+			e.endpoint = endpoint
+		}
 	}
 }
 
@@ -77,6 +78,16 @@ func WithSyntheticDimensions(dimensions int) SyntheticOption {
 	}
 }
 
+// WithSyntheticTimeout overrides the HTTP client timeout for embedding
+// requests. Values <= 0 are ignored, preserving the default.
+func WithSyntheticTimeout(d time.Duration) SyntheticOption {
+	return func(e *SyntheticEmbedder) {
+		if d > 0 && e.client != nil {
+			e.client.Timeout = d
+		}
+	}
+}
+
 func NewSyntheticEmbedder(opts ...SyntheticOption) (*SyntheticEmbedder, error) {
 	e := &SyntheticEmbedder{
 		endpoint:   defaultSyntheticEndpoint + defaultSyntheticPath,
@@ -91,17 +102,18 @@ func NewSyntheticEmbedder(opts ...SyntheticOption) (*SyntheticEmbedder, error) {
 		opt(e)
 	}
 
-	// Try to get API key from environment if not set
+	// Fall back to the environment when no key is configured. The
+	// environment key is only sent to the provider's official endpoint.
 	if e.apiKey == "" {
-		e.apiKey = os.Getenv("SYNTHETIC_API_KEY")
+		key, err := apiKeyFromEnv(e.endpoint, defaultSyntheticEndpoint+defaultSyntheticPath, "SYNTHETIC_API_KEY", "OPENAI_API_KEY")
+		if err != nil {
+			return nil, err
+		}
+		e.apiKey = key
 	}
 
 	if e.apiKey == "" {
-		e.apiKey = os.Getenv("OPENAI_API_KEY")
-	}
-
-	if e.apiKey == "" {
-		return nil, fmt.Errorf("synthetic API key not set (use SYNTHETIC_API_KEY or OPENAI_API_KEY environment variable)")
+		return nil, fmt.Errorf("synthetic API key not set: set embedder.api_key in the grepai config, or SYNTHETIC_API_KEY or OPENAI_API_KEY when using the official endpoint")
 	}
 
 	return e, nil

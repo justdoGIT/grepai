@@ -1,263 +1,103 @@
 ---
 title: Contributing
-description: How to contribute to grepai
+description: grepai works issue first. How to report a bug, request a feature, test a fix or list your tool, and how to build grepai from source.
 ---
 
-## Getting Started
+grepai works **issue first**: every contribution starts as an issue, and the project does not accept pull requests. The same rules are in the repository's [CONTRIBUTING.md](https://github.com/yoanbernabeu/grepai/blob/main/CONTRIBUTING.md).
 
-1. Fork and clone the repository:
+## Why Issue First
+
+With AI coding tools, writing a fix is rarely the hard part. The hard part is knowing exactly what is wrong, on which setup, and what the right behavior is. A precise issue carries all of that. Reviewing an outside pull request, checking it does not break other setups, and reworking it to fit the rest of the code usually takes longer than implementing the fix from a good issue.
+
+So the most useful thing you can send is a detailed issue. The maintainer implements it, tests it against the current release on real projects, and credits you in the changelog. Pull requests opened anyway are closed with a link to open an issue instead.
+
+## Open an Issue
+
+| You have | Where | Include |
+|---|---|---|
+| A bug | [Bug report form](https://github.com/yoanbernabeu/grepai/issues/new?template=bug_report.yml) | `grepai version`, OS, embedder and store from `.grepai/config.yaml` (no keys), exact commands, expected vs actual result, logs |
+| A feature idea | [Feature request form](https://github.com/yoanbernabeu/grepai/issues/new?template=feature_request.yml) | The problem you hit and your real use case, then the solution you have in mind |
+| A question | [Discussions](https://github.com/yoanbernabeu/grepai/discussions) | What you tried |
+| A security issue | [SECURITY.md](https://github.com/yoanbernabeu/grepai/blob/main/SECURITY.md) | Not a public issue |
+
+Search the [existing issues](https://github.com/yoanbernabeu/grepai/issues?q=is%3Aissue) first. If yours is there, add your setup and logs to it: a second reproduction is often what unblocks a fix.
+
+## Other Ways to Help
+
+- **Test a fix.** When a fix lands on a branch, building it and confirming it works on your project is very valuable (see below).
+- **Improve the docs.** If a page is wrong, unclear or out of date, open an issue that quotes the passage and says what is wrong.
+- **List your tool.** Built something around grepai? See [Community Tools](/grepai/community-tools/#contributing-your-tool).
+- **Talk about it.** A star, a post or a talk helps other people find grepai.
+
+## Building From Source
+
+You need:
+
+- Go 1.25.5 or later (the `go` directive in `go.mod`)
+- Git
+- Docker, for `make lint` (it runs golangci-lint in a container)
+
 ```bash
-git clone https://github.com/YOUR_USERNAME/grepai.git
+git clone https://github.com/yoanbernabeu/grepai.git
 cd grepai
+make build        # builds bin/grepai
+make test         # tests with the race detector
 ```
 
-2. Install dependencies:
-```bash
-go mod download
-```
+To try a branch that contains a fix:
 
-3. Run tests:
 ```bash
-make test
-```
-
-4. Build:
-```bash
+git fetch origin <branch>
+git checkout <branch>
 make build
+./bin/grepai version
 ```
 
 ## Development Commands
 
-```bash
-# Build the binary
-make build
+| Command | What it does |
+|---------|--------------|
+| `make build` | Build `bin/grepai` |
+| `make install` | Install `grepai` with `go install` |
+| `make run` | Build, then run `bin/grepai` |
+| `make test` | Run all tests with the race detector (`go test -v -race ./...`) |
+| `make test-cover` | Run tests and write `coverage.out` and `coverage.html` |
+| `make fmt` | Format all Go files with `gofmt -w .` |
+| `make lint` | Run golangci-lint v2.13.2 in Docker |
+| `make lint-local` | Run your locally installed `golangci-lint` |
+| `make pre-commit` | Format, vet, lint and test (see below) |
+| `make build-all` | Cross-compile for Linux, macOS and Windows into `bin/` |
+| `make docs-generate` | Regenerate the CLI reference pages in `docs/src/content/docs/commands/` |
+| `make docs-dev` | Regenerate the CLI pages, then start the docs dev server |
+| `make clean` | Remove `bin/` and coverage files |
 
-# Run tests with race detection
-make test
-
-# Run tests with coverage
-make test-cover
-
-# Format code with gofmt
-make fmt
-
-# Lint with golangci-lint
-make lint
-
-# Run ALL checks before committing (recommended)
-make pre-commit
-
-# Build and run
-make run
-
-# Cross-compile for all platforms
-make build-all
-
-# Generate CLI documentation
-make docs-generate
-```
-
-## Before Committing
-
-Always run the pre-commit checks before pushing your changes:
+The default build has no AST chunking or tree-sitter extraction. To build with them, add the `treesitter` build tag (this needs CGO and a C compiler):
 
 ```bash
-make pre-commit
+go build -tags treesitter -o bin/grepai ./cmd/grepai
 ```
-
-This single command will:
-1. **Format** all Go files with `gofmt`
-2. **Vet** - detect common errors with `go vet`
-3. **Lint** - run comprehensive checks with `golangci-lint`
-4. **Test** - run all tests with race detection
-
-If all checks pass, you're ready to commit!
 
 ## Project Structure
 
-```
+```text
 grepai/
-├── cli/              # CLI commands (Cobra)
-│   ├── root.go
-│   ├── init.go
-│   ├── watch.go
-│   ├── search.go
-│   └── status.go
-├── config/           # Configuration loading
-├── embedder/         # Embedding providers
-│   ├── embedder.go   # Interface
-│   ├── ollama.go
-│   └── openai.go
-├── store/            # Vector storage
-│   ├── store.go      # Interface
-│   ├── gob.go
-│   └── postgres.go
-├── indexer/          # Indexing logic
-│   ├── scanner.go    # File walking
-│   ├── chunker.go    # Text splitting
-│   └── indexer.go    # Orchestration
-├── search/           # Search logic
+├── cmd/
+│   ├── grepai/       # CLI entry point
+│   └── gendocs/      # Generates the CLI reference pages
+├── cli/              # Cobra commands (init, watch, index, search, trace, refs, rpg, mcp-serve, ...)
+├── config/           # Project and workspace configuration
+├── daemon/           # Background watch daemon
+├── embedder/         # Embedding providers and factory.go
+├── framework/        # Framework processors (Vue, Svelte, Astro, Solid)
+├── git/              # Git and worktree detection
+├── indexer/          # Scanner, chunker and indexing orchestration
+├── mcp/              # MCP server and tools
+├── rpg/              # Repository Planning Graph
+├── search/           # Search, hybrid search, boosting
+├── stats/            # Token savings stats
+├── store/            # Vector stores (GOB, PostgreSQL, Qdrant)
+├── trace/            # Symbol extraction and call graphs
+├── updater/          # Self-update
 ├── watcher/          # File watching
-└── docs/             # Documentation (Astro/Starlight)
+└── docs/             # Documentation site (Astro)
 ```
-
-## Adding a New Embedder
-
-1. Create a new file in `embedder/`:
-
-```go
-// embedder/myembedder.go
-package embedder
-
-type MyEmbedder struct {
-    // ...
-}
-
-func NewMyEmbedder(config Config) (*MyEmbedder, error) {
-    // ...
-}
-
-func (e *MyEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
-    // ...
-}
-
-func (e *MyEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
-    // ...
-}
-
-func (e *MyEmbedder) Dimensions() int {
-    return 768 // or whatever your embedder produces
-}
-```
-
-2. Add configuration in `config/config.go`
-
-3. Wire it up in CLI commands
-
-## Adding a New Store
-
-1. Create a new file in `store/`:
-
-```go
-// store/mystore.go
-package store
-
-type MyStore struct {
-    // ...
-}
-
-func NewMyStore(config Config) (*MyStore, error) {
-    // ...
-}
-
-func (s *MyStore) Store(ctx context.Context, chunks []Chunk) error {
-    // ...
-}
-
-func (s *MyStore) Search(ctx context.Context, embedding []float32, limit int) ([]Result, error) {
-    // ...
-}
-
-func (s *MyStore) Delete(ctx context.Context, filePath string) error {
-    // ...
-}
-
-func (s *MyStore) Close() error {
-    // ...
-}
-```
-
-2. Add configuration in `config/config.go`
-
-3. Wire it up in CLI commands
-
-## Adding a Framework Processor
-
-Framework processors normalize non-standard source files (Vue/Svelte/Astro/etc.) into index/trace friendly text while preserving source mapping.
-
-### 1. Implement the processor contract
-
-Create a new file under `framework/` and implement:
-
-- `Name() string`
-- `Supports(filePath string) bool`
-- `Capabilities() ProcessorCapabilities`
-- `TransformForEmbedding(ctx, filePath, source)`
-- `TransformForTrace(ctx, filePath, source)`
-
-Return `ErrNotImplemented` for scaffold placeholders and `ErrUnavailable` when runtime/compiler dependencies are missing.
-
-### 2. Respect mapping invariants
-
-- `GeneratedToSourceLine` is 1-based.
-- Use `0` for generated lines without a reliable source line.
-- Persisted symbols/chunks must always reference the original source path.
-- Keep embedding text and displayed snippet separate when transformed output differs from source.
-
-### 3. Register processor and config flags
-
-- Add processor construction in `cli/watch.go` (`buildFrameworkRegistry`).
-- Add per-framework enable toggle in `config/config.go` under `framework_processing.frameworks`.
-- Honor global mode: `auto | require | off`.
-
-### 4. Required tests
-
-- Registry routing by extension.
-- `auto` fallback behavior.
-- `require` failure behavior.
-- Source line remapping correctness.
-- Regression tests for non-framework files.
-
-### 5. Scaffold examples
-
-- `framework/svelte_processor.go`
-- `framework/astro_processor.go`
-- `framework/solid_processor.go`
-
-These are intentionally non-functional placeholders showing expected structure.
-
-## Commit Convention
-
-Follow conventional commits:
-
-```
-type(scope): description
-
-Types: feat, fix, docs, style, refactor, test, chore
-```
-
-Examples:
-```
-feat(embedder): add support for Cohere embeddings
-fix(watcher): handle symlink loops gracefully
-docs(readme): update installation instructions
-```
-
-## Pull Request Process
-
-1. Create a feature branch:
-```bash
-git checkout -b feat/my-feature
-```
-
-2. Make your changes and commit
-
-3. Run pre-commit checks:
-```bash
-make pre-commit
-```
-
-4. Push and create a PR:
-```bash
-git push origin feat/my-feature
-```
-
-5. Fill out the PR template
-
-## Code Style
-
-- Follow standard Go conventions
-- Run `make lint` before committing
-- Keep functions focused and small
-- Add tests for new functionality
-- Document exported types and functions

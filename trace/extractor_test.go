@@ -2,6 +2,7 @@ package trace
 
 import (
 	"context"
+	"sort"
 	"testing"
 )
 
@@ -34,6 +35,8 @@ func TestRegexExtractor_SupportedLanguages(t *testing.T) {
 		".fs":   true,
 		".fsx":  true,
 		".fsi":  true,
+		".gd":   true,
+		".rb":   true,
 	}
 
 	for _, lang := range langs {
@@ -1467,5 +1470,129 @@ func TestRegexExtractor_ExtractReferences_FiltersBuiltinAndVueInternalNoise(t *t
 	}
 	if hasMax || hasLog || hasKeys || hasRefs {
 		t.Fatalf("expected builtins/vue internals filtered, got max=%v log=%v keys=%v $refs=%v", hasMax, hasLog, hasKeys, hasRefs)
+	}
+}
+
+func TestRegexExtractor_ExtractSymbols_GDScript(t *testing.T) {
+	extractor := NewRegexExtractor()
+	ctx := context.Background()
+
+	content := `class_name PlayerStats extends Node
+
+signal stats_changed
+
+var total_likes := 0
+
+func _ready():
+	activate_node()
+
+static func create_default() -> PlayerStats:
+	return PlayerStats.new()
+
+@rpc("any_peer", "call_local")
+func take_hit(dmg: int) -> void:
+	total_likes -= dmg
+
+@export static func make_from_config(cfg: Dictionary) -> PlayerStats:
+	return PlayerStats.new()
+
+func get_total_likes(
+		include_bonus: bool,
+		bonus: int
+) -> int:
+	return total_likes
+
+class InnerHelper extends RefCounted:
+	@warning_ignore("unused_parameter")
+	func assist(value):
+		return value + 1
+`
+
+	symbols, err := extractor.ExtractSymbols(ctx, "test.gd", content)
+	if err != nil {
+		t.Fatalf("ExtractSymbols failed: %v", err)
+	}
+
+	seen := make(map[string]map[string]bool) // name -> {"function"/"method"/"class"/"exported"} -> value
+	for _, sym := range symbols {
+		kinds, ok := seen[sym.Name]
+		if !ok {
+			kinds = make(map[string]bool)
+			seen[sym.Name] = kinds
+		}
+		switch sym.Kind {
+		case KindFunction:
+			kinds["function"] = true
+		case KindMethod:
+			kinds["method"] = true
+		case KindClass:
+			kinds["class"] = true
+		}
+		if sym.Exported {
+			kinds["exported"] = true
+		}
+	}
+
+	assertSeen := func(name, kind string, wantExported bool) {
+		t.Helper()
+		entry, ok := seen[name]
+		if !ok || !entry[kind] {
+			t.Errorf("missing %s symbol: %s (seen: %v)", kind, name, seenKeys(seen))
+			return
+		}
+		if entry["exported"] != wantExported {
+			t.Errorf("%s exported = %v, want %v", name, entry["exported"], wantExported)
+		}
+	}
+
+	assertSeen("_ready", "function", false)
+	assertSeen("create_default", "function", true)
+	assertSeen("take_hit", "function", true)         // own-line annotation
+	assertSeen("make_from_config", "function", true) // same-line annotation + static
+	assertSeen("get_total_likes", "function", true)  // multiline parameter list
+	assertSeen("assist", "method", true)             // inner class, annotated
+	assertSeen("PlayerStats", "class", true)         // class_name with extends
+	assertSeen("InnerHelper", "class", true)
+}
+
+func seenKeys(m map[string]map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func TestRegexExtractor_ExtractReferences_GDScript(t *testing.T) {
+	extractor := NewRegexExtractor()
+	ctx := context.Background()
+
+	content := `func _ready():
+	activate_node()
+	update_hud()
+
+func refresh():
+	activate_node()
+`
+
+	_, refs, err := extractor.ExtractAll(ctx, "test.gd", content)
+	if err != nil {
+		t.Fatalf("ExtractAll failed: %v", err)
+	}
+
+	counts := make(map[string]int)
+	callers := make(map[string]bool)
+	for _, ref := range refs {
+		counts[ref.SymbolName]++
+		if ref.SymbolName == "update_hud" {
+			callers[ref.CallerName] = true
+		}
+	}
+	if counts["activate_node"] != 2 {
+		t.Errorf("expected 2 activate_node references, got %d", counts["activate_node"])
+	}
+	if !callers["_ready"] {
+		t.Errorf("expected update_hud called from _ready, got callers %v", callers)
 	}
 }

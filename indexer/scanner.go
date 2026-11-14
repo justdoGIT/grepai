@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"unicode/utf8"
 )
 
@@ -37,6 +38,7 @@ func isMinifiedFile(path string) bool {
 // SupportedExtensions lists file extensions to index
 var SupportedExtensions = map[string]bool{
 	".go":     true,
+	".gd":     true,
 	".js":     true,
 	".ts":     true,
 	".jsx":    true,
@@ -47,8 +49,10 @@ var SupportedExtensions = map[string]bool{
 	".c":      true,
 	".cpp":    true,
 	".cc":     true,
+	".cxx":    true,
 	".h":      true,
 	".hpp":    true,
+	".hxx":    true,
 	".cs":     true,
 	".php":    true,
 	".rs":     true,
@@ -112,8 +116,10 @@ type FileMeta struct {
 }
 
 type Scanner struct {
-	root   string
-	ignore *IgnoreMatcher
+	root         string
+	ignore       *IgnoreMatcher
+	extraExts    map[string]bool
+	scanFileCall atomic.Int64
 }
 
 func NewScanner(root string, ignore *IgnoreMatcher) *Scanner {
@@ -121,6 +127,33 @@ func NewScanner(root string, ignore *IgnoreMatcher) *Scanner {
 		root:   root,
 		ignore: ignore,
 	}
+}
+
+// WithCustomExtensions returns the scanner with the given extensions added to
+// the set of extensions it will index, on top of SupportedExtensions. Entries
+// must include the leading dot ("." e.g., ".tengo"); they are normalized to
+// lowercase and entries missing the dot or empty are silently dropped.
+func (s *Scanner) WithCustomExtensions(exts []string) *Scanner {
+	for _, raw := range exts {
+		ext := strings.ToLower(strings.TrimSpace(raw))
+		if ext == "" || !strings.HasPrefix(ext, ".") {
+			continue
+		}
+		if s.extraExts == nil {
+			s.extraExts = make(map[string]bool)
+		}
+		s.extraExts[ext] = true
+	}
+	return s
+}
+
+// IsSupported reports whether files with the given lowercase extension are
+// indexed: built-in SupportedExtensions plus custom extensions.
+func (s *Scanner) IsSupported(ext string) bool {
+	if SupportedExtensions[ext] {
+		return true
+	}
+	return s.extraExts[ext]
 }
 
 // ScanMetadata scans indexable files and returns only file metadata.
@@ -138,6 +171,9 @@ func (s *Scanner) ScanMetadata() ([]FileMeta, []string, error) {
 		if err != nil {
 			return nil
 		}
+		// Store/compare paths with forward slashes so Windows scans match
+		// Postgres / workspace ListDocuments keys (see IndexAll orphan delete).
+		relPath = filepath.ToSlash(relPath)
 
 		// Handle directories: use ShouldSkipDir to respect .grepaiignore negations
 		if d.IsDir() {
@@ -154,7 +190,7 @@ func (s *Scanner) ScanMetadata() ([]FileMeta, []string, error) {
 
 		// Check extension
 		ext := strings.ToLower(filepath.Ext(path))
-		if !SupportedExtensions[ext] {
+		if !s.IsSupported(ext) {
 			return nil
 		}
 
@@ -200,6 +236,7 @@ func (s *Scanner) Scan() ([]FileInfo, []string, error) {
 		if err != nil {
 			return nil
 		}
+		relPath = filepath.ToSlash(relPath)
 
 		// Handle directories: use ShouldSkipDir to respect .grepaiignore negations
 		if d.IsDir() {
@@ -216,7 +253,7 @@ func (s *Scanner) Scan() ([]FileInfo, []string, error) {
 
 		// Check extension
 		ext := strings.ToLower(filepath.Ext(path))
-		if !SupportedExtensions[ext] {
+		if !s.IsSupported(ext) {
 			return nil
 		}
 
@@ -265,8 +302,16 @@ func (s *Scanner) Scan() ([]FileInfo, []string, error) {
 	return files, skipped, err
 }
 
+// ScanFileCallCount returns how many times ScanFile has been called on this
+// scanner. Used by tests to assert startup paths do not re-read unchanged files.
+func (s *Scanner) ScanFileCallCount() int64 {
+	return s.scanFileCall.Load()
+}
+
 func (s *Scanner) ScanFile(relPath string) (*FileInfo, error) {
-	absPath := filepath.Join(s.root, relPath)
+	s.scanFileCall.Add(1)
+	relPath = filepath.ToSlash(relPath)
+	absPath := filepath.Join(s.root, filepath.FromSlash(relPath))
 
 	// Skip minified files
 	if isMinifiedFile(relPath) {

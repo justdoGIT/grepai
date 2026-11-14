@@ -2,7 +2,9 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -93,6 +95,59 @@ func (m *mockVectorStore) GetAllChunks(_ context.Context) ([]store.Chunk, error)
 	return m.getAllChunksItems, nil
 }
 
+var _ store.EmbeddingCache = (*projectPrefixStore)(nil)
+
+type mockPrefixEmbeddingCache struct {
+	mockVectorStore
+	lookup func(context.Context, string, string) ([]float32, bool, error)
+}
+
+func (m *mockPrefixEmbeddingCache) LookupByContentHash(ctx context.Context, hash, contentPrefix string) ([]float32, bool, error) {
+	return m.lookup(ctx, hash, contentPrefix)
+}
+
+func TestProjectPrefixStore_EmbeddingCache(t *testing.T) {
+	lookupErr := errors.New("cache unavailable")
+	for _, tc := range []struct {
+		name   string
+		vector []float32
+		found  bool
+		err    error
+	}{
+		{"hit", []float32{1, 2, 3}, true, nil},
+		{"miss", nil, false, nil},
+		{"error", nil, false, lookupErr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			called := false
+			backing := &mockPrefixEmbeddingCache{lookup: func(gotCtx context.Context, hash, contentPrefix string) ([]float32, bool, error) {
+				called = true
+				// Stored content keeps the project-relative header: the
+				// prefix must reach the backend unchanged.
+				if gotCtx != ctx || hash != "content-hash" || contentPrefix != "File: a.go\n\n" {
+					t.Errorf("lookup did not preserve context/hash/prefix: %q %q", hash, contentPrefix)
+				}
+				return tc.vector, tc.found, tc.err
+			}}
+			p := &projectPrefixStore{store: backing, workspaceName: "workspace", projectName: "project"}
+			var cache store.EmbeddingCache = p
+			vector, found, err := cache.LookupByContentHash(ctx, "content-hash", "File: a.go\n\n")
+			if !called || !reflect.DeepEqual(vector, tc.vector) || found != tc.found || !errors.Is(err, tc.err) {
+				t.Fatalf("lookup = %v, %v, %v; called=%v", vector, found, err, called)
+			}
+		})
+	}
+	t.Run("backend without cache", func(t *testing.T) {
+		p := &projectPrefixStore{store: &mockVectorStore{}}
+		vector, found, err := p.LookupByContentHash(context.Background(), "content-hash", "")
+		if vector != nil || found || err != nil {
+			t.Fatalf("lookup = %v, %v, %v; want cache miss", vector, found, err)
+		}
+	})
+}
+
 func TestDescribeRetryReason(t *testing.T) {
 	tests := []struct {
 		statusCode int
@@ -165,6 +220,36 @@ func TestProjectPrefixStore_SaveChunks(t *testing.T) {
 	}
 }
 
+func TestProjectPrefixStore_SaveChunks_keepsReChunkedIDsUnique(t *testing.T) {
+	ctx := context.Background()
+	mock := &mockVectorStore{}
+	wrapped := &projectPrefixStore{
+		store:         mock,
+		workspaceName: "ws",
+		projectName:   "proj",
+		projectPath:   t.TempDir(),
+	}
+
+	relPath := "dir/my_file.go"
+	chunks := []store.Chunk{
+		{ID: relPath + "_0_0", FilePath: relPath},
+		{ID: relPath + "_0_1", FilePath: relPath},
+		{ID: relPath + "_1", FilePath: relPath},
+	}
+
+	if err := wrapped.SaveChunks(ctx, chunks); err != nil {
+		t.Fatalf("SaveChunks failed: %v", err)
+	}
+
+	prefixed := wrapped.getPrefix() + "/" + relPath
+	want := []string{prefixed + "_0_0", prefixed + "_0_1", prefixed + "_1"}
+	for i, w := range want {
+		if mock.savedChunks[i].ID != w {
+			t.Errorf("chunk%d id = %q, want %q", i, mock.savedChunks[i].ID, w)
+		}
+	}
+}
+
 func TestProjectPrefixStore_PathMappedMethods(t *testing.T) {
 	ctx := context.Background()
 	projectRoot := t.TempDir()
@@ -217,8 +302,18 @@ func TestProjectPrefixStore_PassThroughAndGetChunks(t *testing.T) {
 	ctx := context.Background()
 	projectRoot := t.TempDir()
 	mock := &mockVectorStore{
-		searchResults:         []store.SearchResult{{Score: 0.9}},
-		listDocumentsResult:   []string{"a", "b"},
+		searchResults: []store.SearchResult{{Score: 0.9}},
+		// The underlying shared store sees the full workspace. ListDocuments
+		// must filter to this project's prefix and strip it before returning,
+		// so the indexer's scan-vs-stored diff doesn't treat other projects'
+		// documents as "removed".
+		listDocumentsResult: []string{
+			"ws/proj/main.go",
+			"ws/proj/sub/file.go",
+			"ws/other/main.go",          // different project — must be filtered out
+			"different-ws/proj/main.go", // different workspace — must be filtered out
+			"unprefixed.go",             // no workspace prefix — must be filtered out
+		},
 		getStatsResult:        &store.IndexStats{TotalFiles: 2},
 		listFilesResult:       []store.FileStats{{Path: "p"}},
 		getChunksForFileItems: []store.Chunk{{ID: "c1"}},
@@ -240,8 +335,18 @@ func TestProjectPrefixStore_PassThroughAndGetChunks(t *testing.T) {
 	}
 
 	docs, err := wrapped.ListDocuments(ctx)
-	if err != nil || len(docs) != 2 {
-		t.Fatalf("ListDocuments failed: %v %v", docs, err)
+	if err != nil {
+		t.Fatalf("ListDocuments failed: %v", err)
+	}
+	wantDocs := []string{"main.go", "sub/file.go"}
+	if len(docs) != len(wantDocs) {
+		t.Fatalf("ListDocuments: expected %d paths (filtered + stripped), got %d: %v",
+			len(wantDocs), len(docs), docs)
+	}
+	for i, want := range wantDocs {
+		if docs[i] != want {
+			t.Errorf("ListDocuments[%d]: got %q, want %q", i, docs[i], want)
+		}
 	}
 	if err := wrapped.Load(ctx); err != nil {
 		t.Fatalf("Load failed: %v", err)
@@ -275,11 +380,11 @@ func TestProjectPrefixStore_PassThroughAndGetChunks(t *testing.T) {
 		t.Errorf("GetChunksForFile(abs) path = %q, want %q", mock.getChunksForFilePath, wantPrefixed)
 	}
 
-	// Relative path should pass through as-is when filepath.Rel fails.
+	// Relative paths (watcher, RPG encoder) get the same prefix (#368).
 	if _, err := wrapped.GetChunksForFile(ctx, "relative.go"); err != nil {
 		t.Fatalf("GetChunksForFile(rel) failed: %v", err)
 	}
-	if mock.getChunksForFilePath != "relative.go" {
-		t.Errorf("GetChunksForFile(rel) path = %q, want %q", mock.getChunksForFilePath, "relative.go")
+	if want := wrapped.getPrefix() + "/relative.go"; mock.getChunksForFilePath != want {
+		t.Errorf("GetChunksForFile(rel) path = %q, want %q", mock.getChunksForFilePath, want)
 	}
 }

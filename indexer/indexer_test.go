@@ -15,8 +15,15 @@ import (
 	"github.com/yoanbernabeu/grepai/store"
 )
 
-// mockStore implements store.VectorStore for testing
+// mockStore implements store.VectorStore for testing.
+//
+// Real VectorStore implementations (GOBStore, PostgresStore, QdrantStore) are
+// all safe for concurrent use -- GOBStore guards its maps with a mutex, and
+// the Postgres/Qdrant clients are backed by connection pools. The indexer now
+// calls GetDocument/DeleteByFile concurrently across files, so this mock must
+// honor the same contract; it is guarded by a mutex accordingly.
 type mockStore struct {
+	mu               sync.Mutex
 	documents        map[string]store.Document
 	chunks           map[string]store.Chunk
 	listFilesStats   []store.FileStats
@@ -36,6 +43,8 @@ func newMockStore() *mockStore {
 }
 
 func (m *mockStore) SaveChunks(ctx context.Context, chunks []store.Chunk) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.saveChunksCalled = true
 	for _, chunk := range chunks {
 		m.chunks[chunk.ID] = chunk
@@ -44,6 +53,8 @@ func (m *mockStore) SaveChunks(ctx context.Context, chunks []store.Chunk) error 
 }
 
 func (m *mockStore) DeleteByFile(ctx context.Context, filePath string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.delByFileCalled = true
 	doc, ok := m.documents[filePath]
 	if !ok {
@@ -56,6 +67,8 @@ func (m *mockStore) DeleteByFile(ctx context.Context, filePath string) error {
 }
 
 func (m *mockStore) Search(ctx context.Context, queryVector []float32, limit int, opts store.SearchOptions) ([]store.SearchResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	results := make([]store.SearchResult, 0, len(m.chunks))
 	for _, chunk := range m.chunks {
 		// Filter by path prefix if provided
@@ -78,6 +91,8 @@ func (m *mockStore) Search(ctx context.Context, queryVector []float32, limit int
 }
 
 func (m *mockStore) GetDocument(ctx context.Context, filePath string) (*store.Document, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.getDocCalled = true
 	doc, ok := m.documents[filePath]
 	if !ok {
@@ -87,18 +102,24 @@ func (m *mockStore) GetDocument(ctx context.Context, filePath string) (*store.Do
 }
 
 func (m *mockStore) SaveDocument(ctx context.Context, doc store.Document) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.saveDocCalled = true
 	m.documents[doc.Path] = doc
 	return nil
 }
 
 func (m *mockStore) DeleteDocument(ctx context.Context, filePath string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.delDocCalled = true
 	delete(m.documents, filePath)
 	return nil
 }
 
 func (m *mockStore) ListDocuments(ctx context.Context) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.listDocsCalled = true
 	paths := make([]string, 0, len(m.documents))
 	for path := range m.documents {
@@ -120,6 +141,8 @@ func (m *mockStore) Close() error {
 }
 
 func (m *mockStore) GetStats(ctx context.Context) (*store.IndexStats, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return &store.IndexStats{
 		TotalFiles:  len(m.documents),
 		TotalChunks: len(m.chunks),
@@ -127,6 +150,8 @@ func (m *mockStore) GetStats(ctx context.Context) (*store.IndexStats, error) {
 }
 
 func (m *mockStore) ListFilesWithStats(ctx context.Context) ([]store.FileStats, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	stats := make([]store.FileStats, 0, len(m.documents))
 	for _, doc := range m.documents {
 		stats = append(stats, store.FileStats{
@@ -143,6 +168,8 @@ func (m *mockStore) ListFilesWithStats(ctx context.Context) ([]store.FileStats, 
 }
 
 func (m *mockStore) GetChunksForFile(ctx context.Context, filePath string) ([]store.Chunk, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	doc, ok := m.documents[filePath]
 	if !ok {
 		return nil, nil
@@ -157,6 +184,8 @@ func (m *mockStore) GetChunksForFile(ctx context.Context, filePath string) ([]st
 }
 
 func (m *mockStore) GetAllChunks(ctx context.Context) ([]store.Chunk, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	chunks := make([]store.Chunk, 0, len(m.chunks))
 	for _, chunk := range m.chunks {
 		chunks = append(chunks, chunk)
@@ -195,6 +224,84 @@ func (m *mockEmbedder) Dimensions() int {
 
 func (m *mockEmbedder) Close() error {
 	return nil
+}
+
+// TestFileHash_UnchangedFiles exercises both hash propagation and the scan decision
+// with persisted document metadata, without relying on the mtime fast path.
+func TestFileHash_UnchangedFiles(t *testing.T) {
+	for _, mode := range []string{"sequential", "batched", "cached-batched"} {
+		t.Run(mode, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, "test.go"), []byte("package main\nfunc main() {}\n"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			ignore, err := NewIgnoreMatcher(root, nil, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			scanner := NewScanner(root, ignore)
+			file, err := scanner.ScanFile("test.go")
+			if err != nil || file == nil {
+				t.Fatalf("ScanFile: file=%v err=%v", file, err)
+			}
+			backing := newMockStore()
+			var vectorStore store.VectorStore = backing
+			if mode == "cached-batched" {
+				vectorStore = &fileHashCacheStore{mockStore: backing}
+			}
+			idx := NewIndexer(root, vectorStore, newMockEmbedder(), NewChunker(512, 50), scanner, time.Time{})
+			if mode == "sequential" {
+				_, err = idx.IndexFile(context.Background(), *file)
+			} else {
+				batch := newMockBatchEmbedder()
+				_, _, err = idx.indexFilesBatched(context.Background(), []FileInfo{*file}, batch, nil)
+				if mode == "cached-batched" && batch.embedCalled {
+					t.Error("fully cached file called embedder")
+				}
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(backing.chunks) == 0 {
+				t.Fatal("no chunks saved")
+			}
+			for _, chunk := range backing.chunks {
+				if chunk.FileHash != file.Hash {
+					t.Errorf("FileHash = %q, want %q", chunk.FileHash, file.Hash)
+				}
+			}
+			for _, tc := range []struct {
+				name        string
+				hash        string
+				ids         []string
+				wantReindex bool
+			}{
+				{"matching", file.Hash, []string{"chunk"}, false},
+				{"legacy missing hash", "", []string{"chunk"}, true},
+				{"changed", "different", []string{"chunk"}, true},
+				{"no chunks", file.Hash, nil, true},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					if err := backing.SaveDocument(context.Background(), store.Document{Path: file.Path, Hash: tc.hash, ChunkIDs: tc.ids}); err != nil {
+						t.Fatal(err)
+					}
+					decision, err := idx.decideFileScan(context.Background(), FileMeta{Path: file.Path, ModTime: file.ModTime})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if (decision.file != nil) != tc.wantReindex {
+						t.Errorf("reindex = %v, want %v", decision.file != nil, tc.wantReindex)
+					}
+				})
+			}
+		})
+	}
+}
+
+type fileHashCacheStore struct{ *mockStore }
+
+func (s *fileHashCacheStore) LookupByContentHash(context.Context, string, string) ([]float32, bool, error) {
+	return []float32{0.1, 0.2, 0.3}, true, nil
 }
 
 // TestIndexAllWithProgress_UnchangedFilesSkipped tests that files with matching ModTimes are skipped
@@ -798,9 +905,9 @@ func TestPrepareFileChunks(t *testing.T) {
 			}
 		}
 
-		// Verify DeleteByFile was called
-		if !mockStore.delByFileCalled {
-			t.Error("expected DeleteByFile to be called")
+		// Existing chunks stay until the new ones are embedded (#353)
+		if mockStore.delByFileCalled {
+			t.Error("expected DeleteByFile not to be called before embedding")
 		}
 	})
 
@@ -822,6 +929,11 @@ func TestPrepareFileChunks(t *testing.T) {
 		if len(fileChunks) != 1 {
 			t.Errorf("expected 1 fileChunks entry, got %d", len(fileChunks))
 		}
+
+		// A file that no longer produces chunks has its chunks deleted
+		if !mockStore.delByFileCalled {
+			t.Error("expected DeleteByFile to be called for the empty file")
+		}
 	})
 
 	t.Run("returns empty slices for empty input", func(t *testing.T) {
@@ -839,7 +951,7 @@ func TestPrepareFileChunks(t *testing.T) {
 	})
 }
 
-func TestCreateStoreChunks(t *testing.T) {
+func TestCreateStoreChunks_FileHash(t *testing.T) {
 	now := time.Now()
 
 	t.Run("creates chunks with correct fields", func(t *testing.T) {
@@ -852,13 +964,19 @@ func TestCreateStoreChunks(t *testing.T) {
 			{0.4, 0.5, 0.6},
 		}
 
-		chunks, chunkIDs := createStoreChunks(chunkInfos, embeddings, now)
+		chunks, chunkIDs := createStoreChunks(chunkInfos, embeddings, "file-hash", now)
 
 		if len(chunks) != 2 {
 			t.Fatalf("expected 2 chunks, got %d", len(chunks))
 		}
 		if len(chunkIDs) != 2 {
 			t.Fatalf("expected 2 chunkIDs, got %d", len(chunkIDs))
+		}
+
+		for _, chunk := range chunks {
+			if chunk.FileHash != "file-hash" {
+				t.Errorf("FileHash = %q, want file-hash", chunk.FileHash)
+			}
 		}
 
 		// Verify first chunk
@@ -891,7 +1009,7 @@ func TestCreateStoreChunks(t *testing.T) {
 	})
 
 	t.Run("handles empty input", func(t *testing.T) {
-		chunks, chunkIDs := createStoreChunks([]ChunkInfo{}, [][]float32{}, now)
+		chunks, chunkIDs := createStoreChunks([]ChunkInfo{}, [][]float32{}, "", now)
 
 		if len(chunks) != 0 {
 			t.Errorf("expected 0 chunks, got %d", len(chunks))

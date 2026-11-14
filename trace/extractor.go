@@ -26,6 +26,19 @@ func (e *RegexExtractor) Mode() string {
 	return "fast"
 }
 
+// regexExtractorVersion is bumped manually whenever the regex pattern
+// set in patterns.go is meaningfully revised. Bumping this string
+// invalidates every persisted RegexExtractor symbol cache entry on the
+// next scan, forcing fresh extraction. Use semver-ish strings ("regex-v2",
+// "regex-v2-lua-funcs") so the bump intent is visible in diffs.
+const regexExtractorVersion = "regex-v3-python-gdscript"
+
+// Version returns the extractor's signature used for dedup
+// invalidation. See SymbolExtractor.Version.
+func (e *RegexExtractor) Version() string {
+	return regexExtractorVersion
+}
+
 // SupportedLanguages returns list of supported file extensions.
 func (e *RegexExtractor) SupportedLanguages() []string {
 	langs := make([]string, 0, len(e.patterns))
@@ -549,6 +562,8 @@ func buildIgnoredMask(content string, lang string) []bool {
 		stateBacktick
 		stateLuaLongComment
 		stateLuaLongString
+		stateTripleSingleQuote // Python/GDScript ''' strings
+		stateTripleDoubleQuote // Python/GDScript """ strings
 	)
 
 	state := stateNormal
@@ -619,6 +634,24 @@ func buildIgnoredMask(content string, lang string) []bool {
 				state = stateNormal
 			}
 			continue
+		case stateTripleSingleQuote, stateTripleDoubleQuote:
+			mask[i] = true
+			quote := byte('\'')
+			if state == stateTripleDoubleQuote {
+				quote = '"'
+			}
+			if ch == '\\' && i+1 < len(content) {
+				mask[i+1] = true
+				i++
+				continue
+			}
+			if ch == quote && i+2 < len(content) && content[i+1] == quote && content[i+2] == quote {
+				mask[i+1] = true
+				mask[i+2] = true
+				i += 2
+				state = stateNormal
+			}
+			continue
 		case stateLuaLongComment, stateLuaLongString:
 			mask[i] = true
 			if closeLen := luaLongBracketCloseAt(content, i, luaLongEqCount); closeLen > 0 {
@@ -659,14 +692,38 @@ func buildIgnoredMask(content string, lang string) []bool {
 			}
 		}
 
-		if ch == '/' && next == '/' {
+		if lang == "python" || lang == "gdscript" || lang == "ruby" {
+			// "#" starts a comment; "//" is not a comment in Python (floor
+			// division), GDScript or Ruby.
+			if ch == '#' {
+				mask[i] = true
+				state = stateLineComment
+				continue
+			}
+		}
+		if lang == "python" || lang == "gdscript" {
+			if (ch == '\'' || ch == '"') && i+2 < len(content) && content[i+1] == ch && content[i+2] == ch {
+				mask[i] = true
+				mask[i+1] = true
+				mask[i+2] = true
+				i += 2
+				if ch == '"' {
+					state = stateTripleDoubleQuote
+				} else {
+					state = stateTripleSingleQuote
+				}
+				continue
+			}
+		}
+
+		if lang != "python" && lang != "gdscript" && lang != "ruby" && ch == '/' && next == '/' {
 			mask[i] = true
 			mask[i+1] = true
 			i++
 			state = stateLineComment
 			continue
 		}
-		if ch == '/' && next == '*' {
+		if lang != "python" && lang != "gdscript" && lang != "ruby" && ch == '/' && next == '*' {
 			mask[i] = true
 			mask[i+1] = true
 			i++
@@ -873,8 +930,10 @@ func findFunctionEnd(content string, start int, lang string) int {
 				}
 			}
 		}
-	case "python":
-		// Python uses indentation - find next line with same or less indentation
+	case "python", "gdscript", "ruby":
+		// Python and GDScript use indentation, and Ruby closes a def with an
+		// "end" at the def's indentation: find the next line with the same or
+		// less indentation.
 		startLine := countLines(content[:start])
 		lines := strings.Split(content, "\n")
 		if startLine >= len(lines) {
@@ -974,7 +1033,7 @@ func isExported(name string, lang string) bool {
 	switch lang {
 	case "go":
 		return unicode.IsUpper(rune(name[0]))
-	case "python":
+	case "python", "gdscript":
 		return !strings.HasPrefix(name, "_")
 	default:
 		return true

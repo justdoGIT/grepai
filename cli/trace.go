@@ -6,77 +6,29 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"sort"
 	"strings"
 	"time"
 
-	"github.com/alpkeskin/gotoon"
 	"github.com/spf13/cobra"
 	"github.com/yoanbernabeu/grepai/config"
 	"github.com/yoanbernabeu/grepai/embedder"
+	"github.com/yoanbernabeu/grepai/internal/toon"
 	"github.com/yoanbernabeu/grepai/rpg"
 	gstats "github.com/yoanbernabeu/grepai/stats"
 	"github.com/yoanbernabeu/grepai/trace"
 )
 
-func pickBestTargetSymbol(candidates []trace.Symbol, refs []trace.Reference) *trace.Symbol {
-	if len(candidates) == 0 {
-		return nil
-	}
-	if len(candidates) == 1 {
-		return &candidates[0]
-	}
-
-	bestIdx := 0
-	bestScore := -1
-	for i, sym := range candidates {
-		score := 0
-		for _, ref := range refs {
-			// Prefer symbols referenced from their own file first (component-local/private usage).
-			if ref.File == sym.File || ref.CallerFile == sym.File {
-				score++
-			}
-		}
-		if score > bestScore {
-			bestScore = score
-			bestIdx = i
-		}
-	}
-
-	// Deterministic fallback when all scores are equal.
-	if bestScore <= 0 {
-		sorted := append([]trace.Symbol(nil), candidates...)
-		sort.SliceStable(sorted, func(i, j int) bool {
-			if sorted[i].File == sorted[j].File {
-				return sorted[i].Line < sorted[j].Line
-			}
-			return sorted[i].File < sorted[j].File
-		})
-		return &sorted[0]
-	}
-
-	return &candidates[bestIdx]
-}
-
-func pickBestSymbolForFile(candidates []trace.Symbol, preferredFile string) *trace.Symbol {
-	if len(candidates) == 0 {
-		return nil
-	}
-	if preferredFile != "" {
-		for i := range candidates {
-			if candidates[i].File == preferredFile {
-				return &candidates[i]
-			}
-		}
-	}
-	return &candidates[0]
-}
+// traceExtractionMode is the only symbol extraction mode the index uses.
+// The --mode flag is kept for compatibility but deprecated: it never changed
+// extraction, which always runs the regex ("fast") extractor.
+const traceExtractionMode = "fast"
 
 var (
 	traceMode      string
 	traceDepth     int
 	traceJSON      bool
 	traceTOON      bool
+	traceCompact   bool
 	traceUI        bool
 	traceWorkspace string
 	traceProject   string
@@ -138,9 +90,11 @@ Examples:
 func init() {
 	// Add flags to all trace subcommands
 	for _, cmd := range []*cobra.Command{traceCallersCmd, traceCalleesCmd, traceGraphCmd} {
-		cmd.Flags().StringVarP(&traceMode, "mode", "m", "fast", "Extraction mode: fast (regex) or precise (tree-sitter)")
+		cmd.Flags().StringVarP(&traceMode, "mode", "m", traceExtractionMode, "Deprecated, has no effect")
+		_ = cmd.Flags().MarkDeprecated("mode", "it has no effect: symbols are always extracted in fast (regex) mode")
 		cmd.Flags().BoolVar(&traceJSON, "json", false, "Output results in JSON format")
 		cmd.Flags().BoolVarP(&traceTOON, "toon", "t", false, "Output results in TOON format (token-efficient for AI agents)")
+		cmd.Flags().BoolVarP(&traceCompact, "compact", "c", false, "Output minimal format without call-site context (requires --json or --toon)")
 		cmd.Flags().BoolVar(&traceUI, "ui", false, "Show interactive UI output")
 		cmd.MarkFlagsMutuallyExclusive("json", "toon")
 		cmd.MarkFlagsMutuallyExclusive("json", "ui")
@@ -157,9 +111,20 @@ func init() {
 	rootCmd.AddCommand(traceCmd)
 }
 
+func validateTraceOutputFlags() error {
+	if traceCompact && !traceJSON && !traceTOON {
+		return fmt.Errorf("--compact flag requires --json or --toon flag")
+	}
+	return nil
+}
+
 func runTraceCallers(cmd *cobra.Command, args []string) error {
 	symbolName := args[0]
 	ctx := context.Background()
+
+	if err := validateTraceOutputFlags(); err != nil {
+		return err
+	}
 
 	if traceProject != "" && traceWorkspace == "" {
 		return fmt.Errorf("--project requires --workspace")
@@ -173,7 +138,7 @@ func runTraceCallers(cmd *cobra.Command, args []string) error {
 		}
 		defer trace.CloseSymbolStores(stores)
 
-		result := trace.TraceResult{Query: symbolName, Mode: traceMode}
+		result := trace.TraceResult{Query: symbolName, Mode: traceExtractionMode}
 		for _, ss := range stores {
 			refs, err := ss.LookupCallers(ctx, symbolName)
 			if err != nil {
@@ -184,23 +149,10 @@ func runTraceCallers(cmd *cobra.Command, args []string) error {
 				log.Printf("Warning: failed to lookup symbol %q: %v", symbolName, err)
 			}
 			if len(symbols) > 0 && result.Symbol == nil {
-				result.Symbol = pickBestTargetSymbol(symbols, refs)
+				result.Symbol = trace.PickTargetSymbol(symbols, refs)
 			}
 			for _, ref := range refs {
-				callerSyms, err := ss.LookupSymbol(ctx, ref.CallerName)
-				if err != nil {
-					log.Printf("Warning: failed to lookup caller symbol %q: %v", ref.CallerName, err)
-				}
-				var callerSym trace.Symbol
-				if len(callerSyms) > 0 {
-					if picked := pickBestSymbolForFile(callerSyms, ref.CallerFile); picked != nil {
-						callerSym = *picked
-					} else {
-						callerSym = callerSyms[0]
-					}
-				} else {
-					callerSym = trace.Symbol{Name: ref.CallerName, File: ref.CallerFile, Line: ref.CallerLine}
-				}
+				callerSym := trace.ResolveCallerSymbol(ctx, ss, ref)
 				result.Callers = append(result.Callers, trace.CallerInfo{
 					Symbol: callerSym,
 					CallSite: trace.CallSite{
@@ -260,7 +212,7 @@ func runTraceCallers(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(symbols) == 0 {
-		emptyResult := trace.TraceResult{Query: symbolName, Mode: traceMode}
+		emptyResult := trace.TraceResult{Query: symbolName, Mode: traceExtractionMode}
 		return outputTraceResult(emptyResult, traceViewCallers)
 	}
 
@@ -270,33 +222,17 @@ func runTraceCallers(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to lookup callers: %w", err)
 	}
 
-	target := pickBestTargetSymbol(symbols, refs)
-	if target == nil {
-		target = &symbols[0]
-	}
+	target := trace.PickTargetSymbol(symbols, refs)
 
 	result := trace.TraceResult{
 		Query:  symbolName,
-		Mode:   traceMode,
+		Mode:   traceExtractionMode,
 		Symbol: target,
 	}
 
 	// Convert refs to CallerInfo
 	for _, ref := range refs {
-		callerSyms, err := symbolStore.LookupSymbol(ctx, ref.CallerName)
-		if err != nil {
-			log.Printf("Warning: failed to lookup caller symbol %q: %v", ref.CallerName, err)
-		}
-		var callerSym trace.Symbol
-		if len(callerSyms) > 0 {
-			if picked := pickBestSymbolForFile(callerSyms, ref.CallerFile); picked != nil {
-				callerSym = *picked
-			} else {
-				callerSym = callerSyms[0]
-			}
-		} else {
-			callerSym = trace.Symbol{Name: ref.CallerName, File: ref.CallerFile, Line: ref.CallerLine}
-		}
+		callerSym := trace.ResolveCallerSymbol(ctx, symbolStore, ref)
 		result.Callers = append(result.Callers, trace.CallerInfo{
 			Symbol: callerSym,
 			CallSite: trace.CallSite{
@@ -323,6 +259,10 @@ func runTraceCallees(cmd *cobra.Command, args []string) error {
 	symbolName := args[0]
 	ctx := context.Background()
 
+	if err := validateTraceOutputFlags(); err != nil {
+		return err
+	}
+
 	if traceProject != "" && traceWorkspace == "" {
 		return fmt.Errorf("--project requires --workspace")
 	}
@@ -335,7 +275,7 @@ func runTraceCallees(cmd *cobra.Command, args []string) error {
 		}
 		defer trace.CloseSymbolStores(stores)
 
-		result := trace.TraceResult{Query: symbolName, Mode: traceMode}
+		result := trace.TraceResult{Query: symbolName, Mode: traceExtractionMode}
 		for _, ss := range stores {
 			symbols, err := ss.LookupSymbol(ctx, symbolName)
 			if err != nil {
@@ -419,7 +359,7 @@ func runTraceCallees(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(symbols) == 0 {
-		emptyResult := trace.TraceResult{Query: symbolName, Mode: traceMode}
+		emptyResult := trace.TraceResult{Query: symbolName, Mode: traceExtractionMode}
 		return outputTraceResult(emptyResult, traceViewCallees)
 	}
 
@@ -431,7 +371,7 @@ func runTraceCallees(cmd *cobra.Command, args []string) error {
 
 	result := trace.TraceResult{
 		Query:  symbolName,
-		Mode:   traceMode,
+		Mode:   traceExtractionMode,
 		Symbol: &symbols[0],
 	}
 
@@ -471,6 +411,10 @@ func runTraceCallees(cmd *cobra.Command, args []string) error {
 func runTraceGraph(cmd *cobra.Command, args []string) error {
 	symbolName := args[0]
 	ctx := context.Background()
+
+	if err := validateTraceOutputFlags(); err != nil {
+		return err
+	}
 
 	if traceProject != "" && traceWorkspace == "" {
 		return fmt.Errorf("--project requires --workspace")
@@ -514,7 +458,7 @@ func runTraceGraph(cmd *cobra.Command, args []string) error {
 
 		result := trace.TraceResult{
 			Query: symbolName,
-			Mode:  traceMode,
+			Mode:  traceExtractionMode,
 			Graph: merged,
 		}
 
@@ -561,7 +505,7 @@ func runTraceGraph(cmd *cobra.Command, args []string) error {
 
 	result := trace.TraceResult{
 		Query: symbolName,
-		Mode:  traceMode,
+		Mode:  traceExtractionMode,
 		Graph: graph,
 	}
 
@@ -585,12 +529,21 @@ func runTraceGraph(cmd *cobra.Command, args []string) error {
 func outputAndRecord(result trace.TraceResult, view traceViewKind, projectRoot, commandType string, resultCount int) error {
 	if traceJSON {
 		outputStr := captureJSON(result)
+		if traceCompact {
+			outputStr = captureTraceCompactJSON(result)
+		}
 		fmt.Print(outputStr)
 		recordTraceStats(projectRoot, commandType, resultCount, outputStr)
 		return nil
 	}
 	if traceTOON {
-		outputStr, err := captureTOON(result)
+		var outputStr string
+		var err error
+		if traceCompact {
+			outputStr, err = captureTraceCompactTOON(result)
+		} else {
+			outputStr, err = captureTOON(result)
+		}
 		if err != nil {
 			return err
 		}
@@ -671,9 +624,21 @@ const (
 
 func outputTraceResult(result trace.TraceResult, view traceViewKind) error {
 	if traceJSON {
+		if traceCompact {
+			fmt.Print(captureTraceCompactJSON(result))
+			return nil
+		}
 		return outputJSON(result)
 	}
 	if traceTOON {
+		if traceCompact {
+			output, err := captureTraceCompactTOON(result)
+			if err != nil {
+				return err
+			}
+			fmt.Print(output)
+			return nil
+		}
 		return outputTOON(result)
 	}
 	if traceUI {
@@ -704,6 +669,80 @@ func showTraceActionCardUIError(displayErr error, title, why, action string) err
 	return displayErr
 }
 
+type traceCallSiteCompact struct {
+	File string `json:"file"`
+	Line int    `json:"line"`
+}
+
+type traceCallerInfoCompact struct {
+	Symbol   trace.Symbol         `json:"symbol"`
+	CallSite traceCallSiteCompact `json:"call_site"`
+}
+
+type traceCalleeInfoCompact struct {
+	Symbol   trace.Symbol         `json:"symbol"`
+	CallSite traceCallSiteCompact `json:"call_site"`
+}
+
+type traceResultCompact struct {
+	Query   string                   `json:"query"`
+	Mode    string                   `json:"mode"`
+	Symbol  *trace.Symbol            `json:"symbol,omitempty"`
+	Callers []traceCallerInfoCompact `json:"callers,omitempty"`
+	Callees []traceCalleeInfoCompact `json:"callees,omitempty"`
+	Graph   *trace.CallGraph         `json:"graph,omitempty"`
+}
+
+func compactTraceResult(result trace.TraceResult) traceResultCompact {
+	compact := traceResultCompact{
+		Query:  result.Query,
+		Mode:   result.Mode,
+		Symbol: result.Symbol,
+		Graph:  result.Graph,
+	}
+	if len(result.Callers) > 0 {
+		compact.Callers = make([]traceCallerInfoCompact, 0, len(result.Callers))
+		for _, caller := range result.Callers {
+			compact.Callers = append(compact.Callers, traceCallerInfoCompact{
+				Symbol: caller.Symbol,
+				CallSite: traceCallSiteCompact{
+					File: caller.CallSite.File,
+					Line: caller.CallSite.Line,
+				},
+			})
+		}
+	}
+	if len(result.Callees) > 0 {
+		compact.Callees = make([]traceCalleeInfoCompact, 0, len(result.Callees))
+		for _, callee := range result.Callees {
+			compact.Callees = append(compact.Callees, traceCalleeInfoCompact{
+				Symbol: callee.Symbol,
+				CallSite: traceCallSiteCompact{
+					File: callee.CallSite.File,
+					Line: callee.CallSite.Line,
+				},
+			})
+		}
+	}
+	return compact
+}
+
+func captureTraceCompactJSON(result trace.TraceResult) string {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(compactTraceResult(result))
+	return buf.String()
+}
+
+func captureTraceCompactTOON(result trace.TraceResult) (string, error) {
+	output, err := toon.Encode(compactTraceResult(result))
+	if err != nil {
+		return "", fmt.Errorf("failed to encode TOON: %w", err)
+	}
+	return output + "\n", nil
+}
+
 // captureJSON serializes a TraceResult to a JSON string without writing to stdout.
 func captureJSON(result trace.TraceResult) string {
 	var buf bytes.Buffer
@@ -729,16 +768,15 @@ func outputTOON(result trace.TraceResult) error {
 
 // captureTOON serializes a TraceResult to a TOON string without writing to stdout.
 func captureTOON(result trace.TraceResult) (string, error) {
-	output, err := gotoon.Encode(result)
+	output, err := toon.Encode(result)
 	if err != nil {
 		return "", fmt.Errorf("failed to encode TOON: %w", err)
 	}
 	return output + "\n", nil
 }
 
-// recordTraceStats fires a goroutine to record a trace stats entry without blocking.
+// recordTraceStats records a stats entry for a trace command.
 func recordTraceStats(projectRoot, commandType string, resultCount int, outputStr string) {
-	rec := gstats.NewRecorder(projectRoot)
 	entry := gstats.Entry{
 		Timestamp:    time.Now().UTC().Format(time.RFC3339),
 		CommandType:  commandType,
@@ -747,11 +785,7 @@ func recordTraceStats(projectRoot, commandType string, resultCount int, outputSt
 		OutputTokens: embedder.EstimateTokens(outputStr),
 		GrepTokens:   gstats.GrepEquivalentTokens(resultCount),
 	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer cancel()
-		_ = rec.Record(ctx, entry)
-	}()
+	recordStatsEntry(projectRoot, entry)
 }
 
 func displayCallersResult(result trace.TraceResult) error {

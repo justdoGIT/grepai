@@ -48,6 +48,27 @@ func TestBuildEnsureVectorSQL_ContainsExpectedFragments(t *testing.T) {
 	}
 }
 
+func TestLookupByContentHashSQLScopesCacheIdentity(t *testing.T) {
+	expected := []string{
+		"SELECT vector FROM chunks",
+		"project_id = $1",
+		"content_hash = $2",
+		"embedding_cache_namespace = $3",
+		"left(content, length($4::text)) = $4::text",
+		"vector IS NOT NULL",
+	}
+
+	for _, frag := range expected {
+		if !strings.Contains(lookupByContentHashSQL, frag) {
+			t.Fatalf("expected lookup SQL to contain %q, got: %q", frag, lookupByContentHashSQL)
+		}
+	}
+
+	if strings.Contains(lookupByContentHashSQL, "WHERE content_hash = $1") {
+		t.Fatalf("lookup SQL must not use content_hash as the first and only scope: %q", lookupByContentHashSQL)
+	}
+}
+
 // strconvItoa converts an int to string without importing strconv.
 // This keeps the test dependency surface minimal.
 func strconvItoa(n int) string {
@@ -80,5 +101,24 @@ func strconvItoa(n int) string {
 			buf[i] = '-'
 		}
 		return string(buf[i:])
+	}
+}
+
+func TestEscapeLikePattern(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{in: "src/foo", want: "src/foo"},
+		{in: "src/foo_bar", want: `src/foo\_bar`},
+		{in: "100%/x", want: `100\%/x`},
+		{in: `a\b`, want: `a\\b`},
+		{in: `_%\`, want: `\_\%\\`},
+	}
+
+	for _, tt := range tests {
+		if got := escapeLikePattern(tt.in); got != tt.want {
+			t.Errorf("escapeLikePattern(%q) = %q, want %q", tt.in, got, tt.want)
+		}
 	}
 }

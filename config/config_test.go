@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -44,6 +45,10 @@ func TestDefaultConfig(t *testing.T) {
 		t.Errorf("expected chunk overlap 50, got %d", cfg.Chunking.Overlap)
 	}
 
+	if cfg.Chunking.Strategy != "fixed" {
+		t.Errorf("expected chunking strategy fixed, got %q", cfg.Chunking.Strategy)
+	}
+
 	if !cfg.Framework.Enabled {
 		t.Error("expected framework_processing.enabled=true by default")
 	}
@@ -71,6 +76,11 @@ func TestDefaultConfig(t *testing.T) {
 	}
 	if cfg.Watch.RPGMaxDirtyFilesPerBatch != DefaultWatchRPGMaxDirtyFilesPerBatch {
 		t.Errorf("expected watch.rpg_max_dirty_files_per_batch=%d, got %d", DefaultWatchRPGMaxDirtyFilesPerBatch, cfg.Watch.RPGMaxDirtyFilesPerBatch)
+	}
+	for _, ext := range []string{".cxx", ".hxx"} {
+		if !slices.Contains(cfg.Trace.EnabledLanguages, ext) {
+			t.Errorf("expected trace.enabled_languages to contain %s", ext)
+		}
 	}
 }
 
@@ -100,6 +110,42 @@ func TestDefaultEmbedderForProvider(t *testing.T) {
 	}
 	if openai.Parallelism != DefaultOpenAIParallelism {
 		t.Fatalf("openai parallelism = %d, want %d", openai.Parallelism, DefaultOpenAIParallelism)
+	}
+}
+
+func TestEmbedderConfigCacheNamespace(t *testing.T) {
+	dim := 2048
+	cfg := EmbedderConfig{
+		Provider:   " openai ",
+		Model:      " text-embedding-3-small ",
+		Endpoint:   " https://api.openai.com/v1 ",
+		Dimensions: &dim,
+	}
+
+	got := cfg.CacheNamespace()
+	want := "embedding-cache-v2:provider=openai:model=text-embedding-3-small:dimensions=2048:endpoint=https://api.openai.com/v1"
+	if got != want {
+		t.Fatalf("CacheNamespace() = %q, want %q", got, want)
+	}
+}
+
+func TestEmbedderConfigCacheNamespaceUsesResolvedDimensions(t *testing.T) {
+	cfg := EmbedderConfig{
+		Provider: "openai",
+		Model:    OpenAIEmbeddingModelLarge,
+	}
+
+	if got, want := cfg.CacheNamespace(), "embedding-cache-v2:provider=openai:model=text-embedding-3-large:dimensions=3072:endpoint="; got != want {
+		t.Fatalf("CacheNamespace() = %q, want %q", got, want)
+	}
+}
+
+func TestEmbedderConfigCacheNamespaceChangesForModel(t *testing.T) {
+	small := EmbedderConfig{Provider: "openai", Model: DefaultOpenAIEmbeddingModel}
+	large := EmbedderConfig{Provider: "openai", Model: OpenAIEmbeddingModelLarge}
+
+	if small.CacheNamespace() == large.CacheNamespace() {
+		t.Fatalf("cache namespace must differ across models: %q", small.CacheNamespace())
 	}
 }
 
@@ -172,6 +218,39 @@ func TestConfigLoad_FrameworkProcessingDefaultsRespectExplicitFalseAndNestedDefa
 			}
 			if cfg.Framework.Frameworks.Svelte.Enabled != tt.wantSvelteEnabled {
 				t.Fatalf("framework svelte enabled = %v, want %v", cfg.Framework.Frameworks.Svelte.Enabled, tt.wantSvelteEnabled)
+			}
+		})
+	}
+}
+
+func TestConfigLoad_ChunkingStrategy(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ConfigDir), 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	cfgPath := GetConfigPath(tmpDir)
+
+	tests := []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{"absent defaults to fixed", "chunking:\n  size: 256\n", "fixed"},
+		{"no chunking section defaults to fixed", "version: 1\n", "fixed"},
+		{"ast is preserved", "chunking:\n  strategy: ast\n", "ast"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := os.WriteFile(cfgPath, []byte(tt.yaml), 0o644); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cfg, err := Load(tmpDir)
+			if err != nil {
+				t.Fatalf("Load failed: %v", err)
+			}
+			if cfg.Chunking.Strategy != tt.want {
+				t.Fatalf("chunking strategy = %q, want %q", cfg.Chunking.Strategy, tt.want)
 			}
 		})
 	}
@@ -751,5 +830,51 @@ func TestValidateWatchConfig(t *testing.T) {
 				t.Errorf("ValidateWatchConfig() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestConfigLoad_EmbedderBatchLimits(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ConfigDir), 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	cfgPath := GetConfigPath(tmpDir)
+
+	tests := []struct {
+		name       string
+		yaml       string
+		wantSize   int
+		wantTokens int
+	}{
+		{"absent keeps zero (provider defaults)", "embedder:\n  provider: openai\n", 0, 0},
+		{"custom values", "embedder:\n  provider: openai\n  max_batch_size: 100\n  max_batch_tokens: 50000\n", 100, 50000},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := os.WriteFile(cfgPath, []byte(tt.yaml), 0o644); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cfg, err := Load(tmpDir)
+			if err != nil {
+				t.Fatalf("Load failed: %v", err)
+			}
+			if cfg.Embedder.MaxBatchSize != tt.wantSize || cfg.Embedder.MaxBatchTokens != tt.wantTokens {
+				t.Fatalf("batch limits = (%d, %d), want (%d, %d)",
+					cfg.Embedder.MaxBatchSize, cfg.Embedder.MaxBatchTokens, tt.wantSize, tt.wantTokens)
+			}
+		})
+	}
+
+	// A config saved without batch limits must not gain the new keys.
+	if err := DefaultConfig().Save(tmpDir); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if strings.Contains(string(data), "max_batch") {
+		t.Fatalf("default config should not write batch limit keys, got:\n%s", data)
 	}
 }

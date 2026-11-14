@@ -23,7 +23,7 @@ clean:
 	rm -f coverage.out coverage.html
 
 lint:
-	docker run --rm -v $(PWD):/app -w /app golangci/golangci-lint:v1.64.2 golangci-lint run ./...
+	docker run --rm -v $(PWD):/app -w /app golangci/golangci-lint:v2.13.2 golangci-lint run ./...
 
 lint-local:
 	golangci-lint run ./...
@@ -64,7 +64,7 @@ fmt:
 # Pre-commit checks: format, vet, lint, and test
 pre-commit: fmt
 	go vet ./...
-	docker run --rm -v $(PWD):/app -w /app golangci/golangci-lint:v1.64.2 golangci-lint run ./...
+	docker run --rm -v $(PWD):/app -w /app golangci/golangci-lint:v2.13.2 golangci-lint run ./...
 	go test -race ./...
 	@echo "✓ All checks passed! Ready to commit."
 
@@ -73,4 +73,4 @@ nix-hash:
 	@echo "Computing vendorHash (requires Docker)..."
 	@docker run --rm -v $(PWD):/src -w /src nixos/nix:latest sh -c \
 		'echo "experimental-features = nix-command flakes" >> /etc/nix/nix.conf && \
-		nix build .#grepai 2>&1 | grep "got:" | sed "s/.*got:\s*//"'
+		nix build .#grepai' 2>&1 | grep "got:" | sed 's/.*got:[[:space:]]*//'

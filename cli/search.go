@@ -9,10 +9,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/alpkeskin/gotoon"
 	"github.com/spf13/cobra"
 	"github.com/yoanbernabeu/grepai/config"
 	"github.com/yoanbernabeu/grepai/embedder"
+	"github.com/yoanbernabeu/grepai/internal/toon"
 	"github.com/yoanbernabeu/grepai/rpg"
 	"github.com/yoanbernabeu/grepai/search"
 	"github.com/yoanbernabeu/grepai/stats"
@@ -222,6 +222,9 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to load configuration: %w", err)
 	}
+	if err := config.CheckIndexMeta(config.GetIndexMetaPath(projectRoot), cfg.Embedder); err != nil {
+		return err
+	}
 
 	// Initialize embedder
 	emb, err := embedder.NewFromConfig(cfg)
@@ -242,7 +245,7 @@ func runSearch(cmd *cobra.Command, args []string) error {
 		st = gobStore
 	case "postgres":
 		var err error
-		st, err = store.NewPostgresStore(ctx, cfg.Store.Postgres.DSN, projectRoot, cfg.Embedder.GetDimensions())
+		st, err = store.NewPostgresStore(ctx, cfg.Store.Postgres.DSN, projectRoot, cfg.Embedder.GetDimensions(), cfg.Embedder.CacheNamespace())
 		if err != nil {
 			return fmt.Errorf("failed to connect to postgres: %w", err)
 		}
@@ -251,8 +254,9 @@ func runSearch(cmd *cobra.Command, args []string) error {
 		if collectionName == "" {
 			collectionName = store.SanitizeCollectionName(projectRoot)
 		}
+		namespace := store.QdrantProjectNamespace(cfg.Store.Qdrant.Collection, projectRoot)
 		var err error
-		st, err = store.NewQdrantStore(ctx, cfg.Store.Qdrant.Endpoint, cfg.Store.Qdrant.Port, cfg.Store.Qdrant.UseTLS, collectionName, cfg.Store.Qdrant.APIKey, cfg.Embedder.GetDimensions())
+		st, err = store.NewQdrantStoreWithNamespace(ctx, cfg.Store.Qdrant.Endpoint, cfg.Store.Qdrant.Port, cfg.Store.Qdrant.UseTLS, collectionName, cfg.Store.Qdrant.APIKey, cfg.Embedder.GetDimensions(), namespace, true)
 		if err != nil {
 			return fmt.Errorf("failed to connect to qdrant: %w", err)
 		}
@@ -373,9 +377,8 @@ func outputModeFromFlags(jsonFlag, toonFlag, compactFlag bool) stats.OutputMode 
 	return stats.Full
 }
 
-// recordSearchStats fires a goroutine to record a stats entry without blocking.
+// recordSearchStats records a stats entry for a search command.
 func recordSearchStats(projectRoot, commandType, outputMode string, resultCount int, outputStr string) {
-	rec := stats.NewRecorder(projectRoot)
 	entry := stats.Entry{
 		Timestamp:    time.Now().UTC().Format(time.RFC3339),
 		CommandType:  commandType,
@@ -384,11 +387,7 @@ func recordSearchStats(projectRoot, commandType, outputMode string, resultCount 
 		OutputTokens: embedder.EstimateTokens(outputStr),
 		GrepTokens:   stats.GrepEquivalentTokens(resultCount),
 	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer cancel()
-		_ = rec.Record(ctx, entry)
-	}()
+	recordStatsEntry(projectRoot, entry)
 }
 
 // captureSearchJSON returns JSON-encoded results as a string.
@@ -450,7 +449,7 @@ func captureSearchTOON(results []store.SearchResult, enrichments []rpgEnrichment
 			SymbolName:  enrichments[i].SymbolName,
 		}
 	}
-	output, err := gotoon.Encode(toonResults)
+	output, err := toon.Encode(toonResults)
 	if err != nil {
 		return "", fmt.Errorf("failed to encode TOON: %w", err)
 	}
@@ -470,7 +469,7 @@ func captureSearchCompactTOON(results []store.SearchResult, enrichments []rpgEnr
 			SymbolName:  enrichments[i].SymbolName,
 		}
 	}
-	output, err := gotoon.Encode(toonResults)
+	output, err := toon.Encode(toonResults)
 	if err != nil {
 		return "", fmt.Errorf("failed to encode TOON: %w", err)
 	}
@@ -487,55 +486,12 @@ func outputSearchErrorJSON(err error) error {
 
 // outputSearchErrorTOON outputs an error in TOON format
 func outputSearchErrorTOON(err error) error {
-	output, encErr := gotoon.Encode(map[string]string{"error": err.Error()})
+	output, encErr := toon.Encode(map[string]string{"error": err.Error()})
 	if encErr != nil {
 		return fmt.Errorf("failed to encode TOON error: %w", encErr)
 	}
 	fmt.Println(output)
 	return nil
-}
-
-// SearchJSON returns results in JSON format for AI agents
-func SearchJSON(projectRoot string, query string, limit int) ([]store.SearchResult, error) {
-	ctx := context.Background()
-
-	cfg, err := config.Load(projectRoot)
-	if err != nil {
-		return nil, err
-	}
-
-	emb, err := embedder.NewFromConfig(cfg)
-	if err != nil {
-		return nil, err
-	}
-	defer emb.Close()
-
-	var st store.VectorStore
-	switch cfg.Store.Backend {
-	case "gob":
-		gobStore := store.NewGOBStore(config.GetIndexPath(projectRoot))
-		if err := gobStore.Load(ctx); err != nil {
-			return nil, err
-		}
-		st = gobStore
-	case "postgres":
-		var err error
-		st, err = store.NewPostgresStore(ctx, cfg.Store.Postgres.DSN, projectRoot, cfg.Embedder.GetDimensions())
-		if err != nil {
-			return nil, err
-		}
-	}
-	defer st.Close()
-
-	// Create searcher with boost config
-	searcher := search.NewSearcher(st, emb, cfg.Search)
-
-	return searcher.Search(ctx, query, limit, "")
-}
-
-func init() {
-	// Ensure the search command is registered
-	_ = os.Getenv("GREPAI_DEBUG")
 }
 
 // runWorkspaceSearch handles workspace-level search operations
@@ -558,6 +514,9 @@ func runWorkspaceSearch(ctx context.Context, query string, projects []string, pa
 	if err != nil {
 		return fmt.Errorf("invalid --path value: %w", err)
 	}
+	if err := config.CheckWorkspaceIndexMeta(ws, resolvedProjects); err != nil {
+		return err
+	}
 
 	// Validate backend
 	if err := config.ValidateWorkspaceBackend(ws); err != nil {
@@ -577,7 +536,7 @@ func runWorkspaceSearch(ctx context.Context, query string, projects []string, pa
 
 	switch ws.Store.Backend {
 	case "postgres":
-		st, err = store.NewPostgresStore(ctx, ws.Store.Postgres.DSN, projectID, ws.Embedder.GetDimensions())
+		st, err = store.NewPostgresStore(ctx, ws.Store.Postgres.DSN, projectID, ws.Embedder.GetDimensions(), ws.Embedder.CacheNamespace())
 		if err != nil {
 			return fmt.Errorf("failed to connect to postgres: %w", err)
 		}

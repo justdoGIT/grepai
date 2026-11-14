@@ -7,6 +7,236 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-30
+
+This release only contains fixes, but two of them change behavior: read the **Security** migration if you use a custom embedding endpoint with an API key from the environment, and the Qdrant entry if you set `store.qdrant.collection`.
+
+### Fixed
+
+- **Renamed Files Kept Their Old Path in Embeddings**: the embedding cache matched chunks by body only, while the embedded text starts with `File: <path>`. A renamed, moved or copied file reused vectors computed under the other path, which skewed search results. Renamed and moved files are now re-embedded; identical files at the same project-relative path (e.g. git worktrees in a workspace) still share vectors, and unchanged chunks of an edited file are still reused. No reindex is forced: vectors reused under an old path by earlier 1.x versions stay until their file changes, and an optional rebuild (clear the project's index, then run `grepai index`) refreshes them. (#366)
+- **Projects Sharing a Qdrant Collection Overwrote Each Other**: when several repositories set the same `store.qdrant.collection`, their chunks got the same point IDs (`README.md_0`), so one overwrote the other's files, and indexing one deleted every file of the other that it did not have. Points in an explicitly named collection now carry the repository's identity (`project_namespace` payload, also part of the point ID): the normalized `origin` remote URL, without any credential it contains, plus the project's subdirectory if any, or the absolute project path when there is no git remote (or a local-path one). Searches, listings, stats and deletions only see the current repository. Clones on other machines and linked worktrees of one repository still share one index; checkouts on different branches still overwrite each other's files, as in 1.1.0. Collections named after the project path (no `collection` key, the default) and workspace collections are unchanged: same point IDs, no re-indexing. (#247)
+
+  **Upgrading with an explicit `collection`:** search, status and MCP keep reading the existing points until the project is re-indexed. The first `grepai index` or `grepai watch` re-indexes it: unchanged chunks reuse the vectors already stored, so they are not sent to the embedder again, and the old points of each re-indexed file are deleted. Old points that remain afterwards (files deleted since, or projects not upgraded yet) are reported by a warning at startup; the Qdrant documentation shows how to delete them. Changing the `origin` URL later changes the namespace: the project is re-indexed from scratch, and the points under the previous namespace stay until deleted. **Downgrading, or mixing versions:** an earlier release ignores the namespace, so it sees every project's points again and can still overwrite or delete them as described above; upgrade every project that shares the collection.
+
+- **Changed Files Vanished When Batch Embedding Failed**: with the `openai` provider (and OpenAI-compatible endpoints), `grepai index` and the initial scan of `grepai watch` deleted every changed file's chunks before embedding. A failed or interrupted run (network error, persistent 429, Ctrl+C) left those files out of search until a later successful run, and a one-line edit re-embedded the whole file. Previous chunks are now kept until the new embeddings succeed, and unchanged chunks are reused from the cache. (#353)
+- **Crash Between Delete and Save Hid a File**: if grepai stopped abruptly after deleting a file's chunks but before saving the new ones, the file's document still listed the deleted chunks, so the next start treated it as up to date and the file stayed out of search until it changed. Deleting a file's chunks now also clears its document's chunk list (gob, Postgres). (#356)
+- **Two Watch Daemons Could Run on the Same Index**: the watch PID lock was released right after the PID file was written (git projects and linked worktrees) or dropped by the garbage collector a few seconds later (other projects and workspaces), so a second `grepai watch --background` could start on the same index. When two starts raced, the loser's cleanup also deleted the winner's PID file, making it invisible to `--status` and `--stop`. The lock is now held for the daemon's whole life, and a failed start only cleans up its own files. An empty `*.pid.lock` file now stays in the log directory after a stop. (#357)
+- **Workspace RPG Graph Had No Chunk Links**: in workspace mode, the RPG graph linked no symbol to its chunks, because chunks were looked up without the project prefix. With Qdrant, all chunks of a project also collapsed into a single RPG node, including in single-project mode. Both are fixed; the graph is repaired by the next `grepai index` or `grepai watch`, without re-embedding. (#368)
+- **Trace Picked a Different Definition From Run to Run**: when several symbols share a name, `grepai trace` and the MCP trace tools showed the first definition in index order, which changed as files were re-indexed, and MCP `grepai_trace_callers` did not resolve the target and callers like the CLI. The definition is now chosen deterministically (by file, then line) by shared code for CLI and MCP. `trace callees` no longer lists the symbol's own declaration line or property reads and writes, and lists both calls when two are on one line (`Save(Load())`). Callees of same-name definitions are still merged; `Class::method` scoping is not supported. (#372)
+- **Qdrant Hybrid Search Returned a Single Result**: Qdrant search results had no chunk ID, so hybrid search (`search.hybrid.enabled: true`) merged every result into one. Qdrant writes also returned before being applied, so a read right after a write could miss the file (for example RPG links in `watch`). Results now carry their chunk ID and writes wait until Qdrant applies them. Results with hybrid search disabled are unchanged. (#414)
+
+### Security
+
+- **Environment API Keys Only Sent to Official Endpoints**: when `embedder.api_key` was empty, the `openai`, `openrouter`, `synthetic` and `requesty` embedders sent the key from the environment (`OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `SYNTHETIC_API_KEY`, `REQUESTY_API_KEY`) to whatever `embedder.endpoint` the project config named. A `.grepai/config.yaml` committed in a third-party repository could therefore receive the user's key as soon as grepai ran on it (search, index, watch or MCP). grepai now uses an environment key only when the endpoint is the provider's official host over HTTPS. A config without `endpoint` keeps the official endpoint and works as before.
+
+  **Migration (breaking for custom endpoints):** if you use a custom endpoint (Azure, LiteLLM, vLLM, a proxy…) and relied on the environment variable, set the key in `embedder.api_key` of your config (`.grepai/config.yaml` or `~/.grepai/workspace.yaml`). Until then, grepai stops with an error that names the variable and the endpoint; it never sends an unauthenticated request. A keyless local server (vLLM, TEI…) used through the `openai` provider needs a placeholder such as `api_key: unused`, as in 1.1.0: grepai refuses to start without a key.
+
+- **Project Config Can No Longer Run a Project File as Node.js**: grepai executed `framework_processing.node_path` as is to process `.vue` files. A `.grepai/config.yaml` committed in a third-party repository could point it at a file in that repository, which grepai then ran during `index` or `watch`. grepai now accepts only a Node.js command name resolved through `PATH` (`node`, the default, `nodejs`, `node20`, `node.exe`) or a local absolute path outside the project and its git repository. A relative path, a path that resolves inside the project or its git repository (including through symlinks), a missing path, a `/proc` or `/dev` path, a network path or another command name is ignored with a warning and grepai uses `node` instead. Configs with the default value, a Node.js command name or an absolute path outside the project and its repository are unchanged. A Node.js installed inside the project or its repository (for example by frontend-maven-plugin or `./node_modules/.bin/node`) is no longer used: grepai logs a warning and uses `node` from `PATH`; set `node_path` to an absolute path outside the project to choose another one.
+
+### Documentation
+
+- **Untrusted Repositories**: `SECURITY.md` and the trace guide now warn that compiling `.vue` files runs the `@vue/compiler-sfc` package from the project's own `node_modules`, so grepai should only index repositories you trust, or run with `framework_processing.frameworks.vue.enabled: false`. (#415)
+
+## [1.1.0] - 2026-10-26
+
+### Added
+
+- **Large GOB Index Warning**: after indexing, grepai warns when a `gob` index holds 50,000 chunks or more and recommends the `qdrant` backend. Every search loads and scans the whole `gob` index: on the Go source tree (about 55,000 chunks), that is about 0.5 s and 1.2 GB of RAM per search. The vector stores documentation now gives size guidance.
+- **Configurable Embedding Batch Limits**: `embedder.max_batch_size` and `embedder.max_batch_tokens` cap the inputs and estimated tokens sent in one request by the `openai` provider, for OpenAI-compatible endpoints that time out or fail on the default OpenAI-sized batches (2000 inputs, 280000 tokens). The limits apply to initial indexing and to the watcher. Configs without these keys behave as before. (#92)
+
+### Fixed
+
+- **Watcher Ignored Custom Extensions**: files indexed through `chunking.custom_extensions` (or the workspace equivalent) were never updated by `grepai watch`, because the watcher only knew the built-in extensions. It now uses the same extension list as indexing.
+- **Watcher Ignored Dotfiles**: `grepai watch` dropped every change to a file or directory whose name starts with a dot, although indexing includes them. Edits to files such as `.goreleaser.yml` or `.eslintrc.yml` stayed stale until the next restart, and a dot directory created during the watch (e.g. `.devcontainer/`) was never watched. The watcher now applies the same rules as indexing: `.gitignore`, `.grepaiignore` and the `ignore` config list. (#367)
+- **Workspace Lost Re-Chunked Chunks**: In workspace mode, chunks split again after a context-length error (IDs such as `file.go_3_1`) were renamed to `file.go_1` and overwrote the file's regular chunks, so parts of the file disappeared from search. Sub-chunk IDs now keep their full suffix. Existing workspace indexes need no migration, but a file already affected stays incomplete until it changes and is re-indexed. (#358)
+- **MCP Trace With `root` Used the Wrong RPG Graph**: `grepai_trace_callers`, `grepai_trace_callees` and `grepai_trace_graph` called with `root` loaded symbols from that project but feature paths from the server's startup project, so `feature_path` was missing or wrong. Feature paths now come from the `root` project's RPG graph. (#376)
+- **Postgres `--path` Filter Used Wildcards**: `_`, `%` and `\` in a path prefix acted as SQL `LIKE` wildcards, so `--path store/postgres_` also matched `store/postgres.go`. The prefix is now matched literally, as with GOB and Qdrant. (#363)
+
+### Dependencies
+
+- Bump `github.com/mark3labs/mcp-go` from 1.0.0 to 1.3.0 (#390)
+- Bump `github.com/qdrant/go-client` from 1.19.2 to 1.20.0 (#391)
+
+## [1.0.0] - 2026-10-25
+
+First stable release. Existing configs and indexes keep working. On first start, the symbol index is re-extracted once (trace fixes), Windows single-project indexes that stored backslash paths are rebuilt, and an index whose embedding model no longer matches the config is rebuilt.
+
+### Documentation
+
+- **New Documentation Site**: new landing page, rewritten guides, per-page illustrations, and SEO metadata (Open Graph images, sitemap, `llms.txt`) (#343)
+
+### Added
+
+- **GDScript in Trace**: `grepai trace` now extracts GDScript (`.gd`) functions and calls, including functions with annotations on the same line (#296, from #297) - @tadki
+- **Ruby in Trace**: `grepai trace` now extracts Ruby methods (`def` and `def self.`, including names ending in `?`, `!` or `=`), classes and modules, and their calls. New configs trace `.rb` by default (#128)
+- **MCP in `agent-setup`**: the instructions written by `grepai agent-setup` now tell agents to prefer the grepai MCP tools when they are available and to use the CLI otherwise. Files that already have a grepai section are left unchanged (#168)
+
+### Performance
+
+- **Fewer Embeddings When a File Changes**: Re-indexing a modified file deleted its chunks before the embedding cache lookup, so every edit re-embedded the whole file. Unchanged chunks now reuse their vectors: a one-line edit to a 27-chunk file embeds 1 chunk instead of 27 (from #342) - @wwylon
+
+### Fixed
+
+- **Stats Never Recorded From the CLI**: `grepai search` and `grepai trace` wrote their stats entry from a fire-and-forget goroutine, so the process usually exited before the write and `grepai stats` stayed empty for CLI usage. The command now waits for the write, bounded to 500ms. (#345)
+- **Boost Patterns Missed Top-Level Directories**: Default patterns such as `/src/`, `/tests/` and `/docs/` never matched top-level directories because indexed paths have no leading slash, and never matched at all on Windows because of backslashes. Paths are now matched slash-separated with a leading `/`. (#345)
+- **TOON Output Field Names**: TOON headers contained raw tag options such as `"symbol_name,omitempty"`, empty `omitempty` fields were always emitted, and `json:"-"` fields leaked. TOON output (CLI and MCP) now uses the same field names and rules as JSON. (#345)
+- **`grepai init` Flags**: `--model` was ignored for `ollama`, `lmstudio` and `synthetic`; `--backend postgres|qdrant` with `--yes` left the DSN or endpoint empty instead of writing the backend defaults; the help text listed only Ollama/OpenAI and GOB/PostgreSQL. (#345)
+- **Help Texts**: `grepai mcp-serve --help` listed 11 of the 14 MCP tools, and `grepai watch --help` gave the wrong log file name inside git repositories (`grepai-worktree-<id>.log`). (#345)
+- **Config Edits Lost While Watching**: Preserve user changes to `.grepai/config.yaml`, including `ignore`, when saving `watch.last_index_time` after indexing (#179, #344) - @Don-Yin
+- **Windows Index Wiped on Workspace Watch Restart**: Scanner paths are now normalized to forward slashes so they match the workspace store keys; legacy single-project indexes with backslash paths are removed as orphans on the next index pass (#329) - @wwylon
+- **Python Call Edges Lost in Trace**: An apostrophe in a `#` comment (`# don't`) opened a string that hid every later call in the file, `//` (floor division) was treated as a comment, and `'''` docstrings with an apostrophe closed early. Python comments and triple-quoted strings are now handled, Python syntax keywords are no longer reported as calls, and existing symbol indexes are re-extracted once (#280)
+- **Index Stale After a Crash**: `watch.last_index_time` was saved before the index itself, so after a crash, a kill or a shutdown timeout the next start mtime-skipped files whose new content was never saved. The stamp is now written only after the vector and symbol indexes are saved; a file whose re-indexing fails is retried on the next scan; and watch sessions wait up to 30s (was 2s) to finish their final save on shutdown (#311, #235)
+- **Embedding Model Change Mixed Vectors**: Changing `embedder.model`, `provider` or `dimensions` kept the old vectors, so search silently returned wrong results. grepai now records the embedder of each index (`.grepai/index-meta.json`): `index` and `watch` rebuild the index after a change, and `search` refuses to use a stale index. Existing indexes are adopted without re-indexing (#139)
+- **Qdrant Truncated Reads**: Listing files and chunks read a single page of points, so on larger collections files deleted while the watcher was stopped stayed in results, `status` showed 0 files, and path-filtered searches returned too few results. All reads now page through the collection (#195, #192)
+- **Background Watch on Large Projects**: `watch --background` stopped the watcher when the initial index took more than 30s (60s for workspaces). A watcher past its startup checks now keeps running and the command reports that indexing is still in progress (#218)
+- **MCP Workspace Search With a Path**: Searching a workspace with `path` but without a single project always returned no results. The path now follows the CLI rule: relative to the project with one project, otherwise starting with the project name (#296)
+- **Missing Workspace Project**: The workspace watcher refused to start when one project folder was missing; it now skips it with a warning (#127)
+- **`.grepai` Showing in Git**: `grepai init` only updated an existing `.gitignore`; without one it now writes `.grepai/.gitignore` (#186)
+- **Windows Deletes Missed by the Watcher**: File event paths now use forward slashes like indexed paths, so deletes and renames are applied on Windows
+- **Folders Moved or Deleted While Watching**: Moving or deleting a folder left all its files in search results, and a folder moved into the project was not indexed until each file changed. The watcher now removes the files of a folder that goes away and indexes the files of a folder that appears (#310)
+- **Invalid Workspace Project Config**: A project whose `.grepai/config.yaml` could not be parsed was indexed with the default settings, and the next save overwrote the user's file. It is now an error that names the file, and the file is left untouched (#312)
+- **RPG MCP Tools in Workspaces**: `grepai_rpg_search`, `grepai_rpg_fetch` and `grepai_rpg_explore` now accept `workspace` and `project` like the other MCP tools, instead of reporting RPG as disabled (#296)
+- **Qdrant Connection Errors**: A Qdrant server that is down or unreachable now reports the address and how to start it, instead of a raw gRPC error (#177)
+
+### Removed
+
+- **Settings That Never Had an Effect**: `trace.mode`, `trace.exclude_patterns`, `update.check_on_startup` and `rpg.store_path` were written to `config.yaml` but never read by any version. They are no longer written; existing files still load and the keys are dropped on the next save.
+
+### Deprecated
+
+- **`grepai trace --mode`**: the flag never changed symbol extraction (always the regex extractor). It is still accepted with a deprecation warning, and trace output always reports `"mode": "fast"`.
+
+## [0.39.0] - 2026-10-25
+
+### Added
+
+- **One-Time Manual Indexing**: New `grepai index` command updates a project's vector, symbol and optional RPG indexes once and exits, without starting a watcher or daemon, using the same incremental logic as `grepai watch`. `grepai index --workspace <name>` indexes every project of a workspace, continues past a failing project and returns an aggregate error, so CI jobs and Git hooks fail loudly instead of leaving a partial index (#299, addresses the manual indexing part of #193) - @harumiWeb
+
+### Fixed
+
+- **Qdrant Re-Indexed Unchanged Files**: With the Qdrant backend, every watcher start re-embedded every file, because the store never kept per-file metadata, so neither the modification-time nor the content-hash check could ever match. Each point now stores the whole-file hash (`file_hash`) and unchanged files are skipped. Existing indexes need no migration: unchanged files are skipped from the next start and gain the field when they change. In workspace mode, the content-hash embedding cache is now reachable as well (#324) - @greenham13
+- **Edits Made During a Scan Were Lost**: `watch.last_index_time` was set to the end of the startup scan, so a file modified while a long scan was running was skipped on every later restart and stayed stale in search results until it was edited again. The timestamp now records the start of the scan, is repaired when missing even if nothing needed indexing, and is saved on clean shutdown (#328) - @TangoMan75
+
+### Performance
+
+- **Fewer File Reads on Restart**: The symbol index phase now reuses the files already read and hashed by the vector phase instead of reading them a second time, and startup reports `Index up to date: N files checked, 0 reindexed` when nothing changed (#328) - @TangoMan75
+
+## [0.38.0] - 2026-10-24
+
+### Added
+
+- **AST-Aware Chunking (experimental)**: New opt-in, experimental `chunking.strategy: ast` splits Go, Python, JavaScript and TypeScript files along function, class and declaration boundaries (cAST algorithm) instead of fixed-size windows, so a chunk is usually a whole function or a group of related declarations. It requires building with the `treesitter` tag. Other builds and unknown strategy names log a warning and use the fixed-size chunker, as do other file types (#332) - @Don-Yin
+
+### Performance
+
+- **Batched Ollama Indexing**: Ollama indexing now sends up to 64 chunks per request to the modern `/api/embed` endpoint instead of one request per chunk, with `truncate: false` so grepai's adaptive re-chunking stays authoritative. Servers or proxies that only provide the legacy `/api/embeddings` endpoint are detected once and used from then on. Search queries are unchanged, and existing indexes stay compatible since the vectors only differ in norm, not direction (#315, closes #314) - @jeremyakers
+
+### Fixed
+
+- **Redundant Trailing Chunk**: Every file longer than the chunk overlap (200 characters with the default `overlap: 50`) got one extra chunk at the end holding only the last lines of the chunk before it, costing an extra embedding request per file and competing in search with the chunk it duplicated. Chunking now stops once a chunk reaches the end of the file, and so does re-chunking of oversized chunks (#333) - @MaxFreedomPollard
+- **Watcher Exits on Event Bursts**: A burst of file changes that filled the watcher's internal event queue was treated as a fatal error, stopping `grepai watch` and forcing a full rescan on restart. The watcher now waits for room in the queue instead, and flushes are serialized so a stale delete can never be delivered after a newer re-create of the same file (#326) - @greenham13
+
+### Dependencies
+
+- Bump `github.com/jackc/pgx/v5` from 5.10.0 to 5.11.0 (#318)
+- Bump `github.com/qdrant/go-client` from 1.19.0 to 1.19.2 (#317)
+- Bump `google.golang.org/grpc` from 1.83.2 to 1.84.0 (#323)
+
+## [0.37.0] - 2026-09-10
+
+### Added
+
+- **Per-Request Project Root for MCP Tools**: Project-scoped MCP tools (`grepai_search`, `grepai_trace_callers`, `grepai_trace_callees`, `grepai_trace_graph`, `grepai_refs_readers`, `grepai_refs_writers`, `grepai_refs_graph`, `grepai_index_status`) accept an optional `root` parameter with an absolute project path; configuration, vector store and symbol index are loaded from that path instead of the server startup project, enabling per-launch project detection across multiple projects without restarting `mcp-serve` (#305) - @wasup-yash
+  - Specifying both `workspace` and `root` in one request is rejected; an explicit `root` also takes precedence over a server started with `--workspace`
+  - The server now advertises tool capabilities during MCP initialization (`server.WithToolCapabilities(true)`), which some MCP clients require before discovering server features/roots
+
+### Fixed
+
+- **Non-Reproducible Search Ranking**: Results that scored exactly the same came back in a different order on every search over an unchanged index, because callers assembled them by ranging over a Go map and `sort.Slice` is not stable. Since callers truncate to a limit after sorting, this also changed **which** results were returned, not just their order. Score ties now break on the chunk ID, which is unique within a store, so an unchanged index returns the same ranking every time (#303) - @MaxFreedomPollard
+- **Idle GOB Index Rewrites**: Vector and symbol GOB stores now persist only when modified, eliminating full-index rewrites every 30 seconds when idle (#298) - @jeremyakers
+- **Atomic GOB Replacement**: Failed cross-platform index replacement now preserves the previous index instead of falling back to a remove-then-rename window that could leave no index after interruption - @jeremyakers
+- **Concurrent Watcher Snapshot Loss**: Foreground, background, and workspace watchers now enforce one lifetime writer per canonical project root, while read-only search, MCP, and trace processes remain concurrent - @jeremyakers
+- **Missing-Index Reader Overwrites**: Read-only vector and symbol GOB stores that load before an index exists now close cleanly without replacing an index created later, while real pre-load mutations and direct first persists are preserved - @jeremyakers
+- **Worktree Seed Races**: Worktree auto-initialization now copies complete vector and symbol seed indexes under the project writer lock before exposing the copied configuration - @jeremyakers
+- **GOB Mutable Aliases**: Vector GOB stores now own deep copies of mutable inputs, and symbol lookups return detached slices, preventing caller mutations from changing clean in-memory snapshots - @jeremyakers
+- **Worktree Auto-Init Rollback**: Seed and configuration files are now atomically published from synced temporary files, failed copy stages remove partial destinations, and only a parseable configuration counts as initialization completion - @jeremyakers
+- **Incomplete or Stale File Watching**: File, worktree, and workspace watchers now fail closed when a directory watch cannot be registered, fsnotify closes or reports an error, or the internal event queue cannot keep up. Fatal coverage shutdown withdraws daemon readiness and synchronously aborts event handling without flushing potentially untrustworthy derived state; the CLI then exits immediately and lets the OS reclaim watcher descriptors. Library callers that remain alive after receiving a fatal error may call `Close` to release the backend explicitly. The next startup's full scan repairs the indexes. Ready markers are PID-validated, write failures stop startup, timed-out children are stopped and cleaned up, and stale PID cleanup removes the matching marker. On Linux, registration `ENOSPC` means the per-user inotify watch quota is exhausted, not that the filesystem is out of disk space (#304) - @jeremyakers
+  - **Behaviour change**: `grepai watch` now exits on a filesystem watch failure where it previously logged a warning and kept running. On a host whose inotify quota is exhausted, this surfaces as a startup error instead of a watcher that silently misses changes. The error names the affected path and, on Linux, explains the quota.
+
+### Dependencies
+
+- Bump `github.com/mark3labs/mcp-go` from 0.58.0 to 1.0.0 (#302)
+
+## [0.36.1] - 2026-09-01
+
+### Fixed
+
+- **Files Dropped From the Index on Atomic Writes**: An atomic write — write to a temp file, then rename it over the target — surfaces as `RENAME`/`REMOVE` on a path whose file is still on disk, and the watcher removed it from both the vector and symbol indexes, silently, until the next manual save or watcher restart (#295, closes #225 and #129) - @yoanbernabeu
+  - Editors and coding agents (Claude Code, Cursor) save this way, so the files being dropped were exactly the ones being actively worked on
+  - The same cause emptied the index wholesale on `git checkout` across a diverged branch, since git writes files by renaming over them — reproduced as `Files indexed: 0` on a 20-file repository
+  - The event is now re-qualified as a modification when the path still resolves to a regular file; genuine deletions are unaffected
+  - Credit to @Third-Thing, who identified this class of false removals independently in July
+- **Stale Symbols After Upgrade**: Pair each persisted symbol entry with the extractor version that produced it, so a release shipping improved symbol extraction re-processes unchanged files instead of leaving stale symbols in place until `.grepai/symbols.gob` is deleted by hand (#264) - @kryptt
+  - The first `grepai watch` after upgrading re-extracts symbols for every traced file once, then returns to normal incremental behaviour
+  - Symbol extraction only: the vector index is untouched and **no re-embedding occurs**, so there is no API cost and no reindexing to plan
+  - Existing `symbols.gob` files load unchanged, and remain readable if you downgrade
+
+### Changed
+
+- **Go Toolchain From `go.mod`**: The release and docs workflows now resolve the Go version from `go.mod` (`go-version-file`) instead of a hardcoded pin, so the toolchain can no longer drift from what the module actually requires (#293) - @yoanbernabeu
+- Building from source now requires Go 1.25.5 or later, up from 1.25.0 (#288). Installing a released binary is unaffected
+
+### Dependencies
+
+- Bump `github.com/mark3labs/mcp-go` from 0.45.0 to 0.58.0 (#288)
+- Bump `google.golang.org/grpc` from 1.82.1 to 1.83.2 (#289)
+- Bump `actions/setup-go` from 5 to 7 (#292), `actions/setup-node` from 6 to 7 (#290)
+
+## [0.36.0] - 2026-08-30
+
+### Added
+
+- **Vue SFC Support**: Process Vue single-file components for search and trace, with source remapping back to original line numbers (#157) - @mika76
+- **File-Level Deduplication**: Configurable `search.dedup` to collapse multiple chunks from the same file into a single result (#188) - @Don-Yin
+- **RPG CLI Commands**: `grepai rpg search`, `grepai rpg fetch` and `grepai rpg explore`, plus `--compact` structured output for `trace` and `refs`, bringing the CLI to parity with the MCP server (#240) - @teelicht
+- **Custom File Extensions**: New `chunking.custom_extensions` option to index file types outside the built-in list, for niche or polyglot codebases (#256) - @kryptt
+- **Configurable Embedder Timeout and Retries**: New `embedder.request_timeout_seconds` and `embedder.max_retries` for slow self-hosted endpoints; defaults are unchanged (60s, 5 attempts) (#257) - @kryptt
+- **Requesty Provider**: Add Requesty as a new embedding provider
+  - Requesty (`requesty`): Multi-provider gateway via `https://router.requesty.ai/v1` with OpenAI-compatible embeddings (`openai/text-embedding-3-small`, 1536 dims)
+  - API key resolved from `REQUESTY_API_KEY` (falling back to `OPENAI_API_KEY`)
+  - Integrated into the embedder factory (`NewFromConfig`), `grepai init` prompts, and shell completion (#268) - @Thibaultjaigu
+- **Opt Out of Worktree Discovery**: New `watch.discover_worktrees` option to stop `grepai watch` from auto-initializing and watching every linked git worktree (#270) - @rusel95
+- **C++ `.cxx` / `.hxx` Support**: Index and trace `.cxx` and `.hxx` files, which were previously skipped despite being advertised in the default config (#276) - @Third-Thing
+
+### Fixed
+
+- **Watcher Crash on Long Runs**: Add a mutex to the RPG graph, fixing the `concurrent map iteration and map write` crash that killed `grepai watch` after hours of use (#206, closes #279) - @drizzt
+- **Gitignore Root Match**: Fix `.gitignore` pattern `.*/` incorrectly matching the root directory and preventing all files from being indexed (#203, closes #202) - @pingtimeout
+- **Qdrant Search on Large Repos**: Raise the gRPC max message size to 64 MB and stop fetching unused vectors in `GetAllChunks`, fixing `ResourceExhausted` errors on hybrid search (#207) - @drizzt
+- **Windows Qdrant Collection Names**: Sanitize `\` and `:` in collection names derived from Windows paths (#201) - @AkosLukacs
+- **Corrupted Index Recovery**: Write `index.gob` atomically, and quarantine an already-truncated index to `index.gob.corrupt` instead of failing forever with `unexpected EOF` (#269) - @rusel95
+- **Postgres Embedding Cache Scoping**: Scope the content-hash cache by project and by embedder identity (provider/model/dimensions/endpoint), preventing cross-project and cross-model vector reuse (#252, closes #249 and #251) - @3em0
+- **OpenAI 300k Token Limit**: Detect the API's `maximum request size` error and recursively split the batch until it fits, instead of failing the whole indexing run (#226, closes #214) - @p1ng0o
+- **Workspace Document Scoping**: Scope `projectPrefixStore.ListDocuments` to the current project, fixing wildly inflated "files removed" counts and thousands of pointless store roundtrips on every workspace scan (#263) - @kryptt
+- **Agent Skill Accuracy**: Replace absolute "never use grep" instructions with a recall-safe combination, since semantic search returns a ranking rather than an exhaustive result set (#272) - @rusel95
+- **Nix Package Build**: Add `git` and `nodejs` to `nativeCheckInputs` in the flake, so the test phase no longer fails with `exec: "git": executable file not found in $PATH` (closes #244)
+
+### Performance
+
+- **Faster Watcher Startup**: Parallelize file-change detection and replace `filepath.Walk` with `WalkDir` in the watcher, cutting restart time on large repositories (#277) - @Slicit
+
+### Changed
+
+- **Go 1.25 Required to Build**: `qdrant/go-client` 1.19.0, `pgvector-go` 0.4.1 and `pgx/v5` 5.10.0 all require Go 1.25, so building grepai from source now needs Go 1.25 or later. Installing a released binary is unaffected. The CI matrix and `golangci-lint` (pinned to v2.13.2) were aligned accordingly (#284, #286, #287)
+
+### Dependencies
+
+- Bump `github.com/qdrant/go-client` from 1.17.1 to 1.19.0 (#253)
+- Bump `github.com/pgvector/pgvector-go` from 0.3.0 to 0.4.1 (#254)
+- Bump `github.com/jackc/pgx/v5` from 5.8.0 to 5.10.0 (#228)
+- Bump `github.com/fsnotify/fsnotify` from 1.9.0 to 1.10.1 (#238)
+- Bump `actions/checkout` from 6 to 7 (#267), `codecov/codecov-action` from 5 to 7 (#265), `actions/upload-pages-artifact` from 4 to 5 (#227), `actions/deploy-pages` from 4 to 5 (#208)
+
 ## [0.35.0] - 2026-03-16
 
 ### Added
@@ -633,7 +863,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial public release
 
-[Unreleased]: https://github.com/yoanbernabeu/grepai/compare/v0.35.0...HEAD
+[Unreleased]: https://github.com/yoanbernabeu/grepai/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/yoanbernabeu/grepai/compare/v1.1.0...v1.2.0
+[1.1.0]: https://github.com/yoanbernabeu/grepai/compare/v1.0.0...v1.1.0
+[1.0.0]: https://github.com/yoanbernabeu/grepai/compare/v0.39.0...v1.0.0
+[0.39.0]: https://github.com/yoanbernabeu/grepai/compare/v0.38.0...v0.39.0
+[0.38.0]: https://github.com/yoanbernabeu/grepai/compare/v0.37.0...v0.38.0
+[0.37.0]: https://github.com/yoanbernabeu/grepai/compare/v0.36.1...v0.37.0
+[0.36.1]: https://github.com/yoanbernabeu/grepai/compare/v0.36.0...v0.36.1
+[0.36.0]: https://github.com/yoanbernabeu/grepai/compare/v0.35.0...v0.36.0
 [0.35.0]: https://github.com/yoanbernabeu/grepai/compare/v0.34.0...v0.35.0
 [0.34.0]: https://github.com/yoanbernabeu/grepai/compare/v0.33.0...v0.34.0
 [0.33.0]: https://github.com/yoanbernabeu/grepai/compare/v0.32.1...v0.33.0

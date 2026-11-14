@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 )
@@ -132,7 +133,7 @@ func TestPostgresStoreSearchWithPathPrefix(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	store, err := NewPostgresStore(ctx, dsn, "test-project-"+randomString(8), 3)
+	store, err := NewPostgresStore(ctx, dsn, "test-project-"+randomString(8), 3, "test-cache-namespace")
 	if err != nil {
 		t.Skip("could not connect to PostgreSQL:", err)
 	}
@@ -248,7 +249,5 @@ func randomString(length int) string {
 
 // testGetPostgresDSN retrieves PostgreSQL DSN from environment or returns empty string
 func testGetPostgresDSN(_ *testing.T) string {
-	// This would normally read from environment or test config
-	// For now, return empty to skip PostgreSQL tests
-	return ""
+	return os.Getenv("GREPAI_POSTGRES_TEST_DSN")
 }
